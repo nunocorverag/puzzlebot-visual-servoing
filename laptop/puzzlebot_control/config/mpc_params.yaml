@@ -1,0 +1,37 @@
+mpc_node:
+  ros__parameters:
+    # ── Horizon & timing ────────────────────────────────────────────────────
+    N: 5                  # prediction horizon (steps)
+    control_rate: 20.0    # control loop rate (Hz)
+    dt: 0.05              # discretization step — must equal 1/control_rate
+
+    # ── Vision feature target ────────────────────────────────────────────────
+    area_desired: 25000.0  # target contour area in pixels² (tune for desired distance)
+
+    # ── Interaction matrix gain ──────────────────────────────────────────────
+    Kv: 0.3               # ė_area ≈ Kv·v  (increase if robot approaches too slowly)
+
+    # ── Stage cost weights ───────────────────────────────────────────────────
+    Qx: 10.0              # e_x stage penalty
+    Qa:  1.0              # e_area stage penalty
+    Rv:  0.1              # linear velocity regularization
+    Ro:  0.1              # angular velocity regularization
+
+    # ── Terminal cost weights (enforce convergence) ──────────────────────────
+    Px: 50.0              # e_x terminal penalty
+    Pa:  5.0              # e_area terminal penalty
+
+    # ── Actuation limits ─────────────────────────────────────────────────────
+    v_max:     0.25       # maximum linear velocity  [m/s]
+    omega_max: 0.5        # maximum angular velocity [rad/s]
+
+    # ── Grid resolution ──────────────────────────────────────────────────────
+    v_candidates:     7   # number of v samples in [0, v_max]
+    omega_candidates: 11  # number of ω samples in [−ω_max, ω_max]
+
+    # ── Safety ───────────────────────────────────────────────────────────────
+    detection_timeout: 0.5  # stop robot if no detection for this many seconds
+
+visualizer_node:
+  ros__parameters:
+    area_desired: 25000.0  # keep in sync with mpc_node
