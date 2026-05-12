@@ -5,9 +5,9 @@ sampling-based Model Predictive Controller (MPC).
 
 ## Documentation
 
-- [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md): English system overview,
-  architecture, topics, perception, control FSM, obstacle handling, safety, and
-  logging.
+- [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md): deep English project
+  explanation covering theory, architecture, perception, visual servoing, MPC,
+  FSM behavior, obstacle handling, safety, logging, limitations, and future work.
 - [RUNBOOK.md](RUNBOOK.md): operational runbook, tuning notes, diagnostics, and
   bench-test procedures.
 
