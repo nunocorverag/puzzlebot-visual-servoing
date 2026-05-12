@@ -6,17 +6,19 @@ sampling-based Model Predictive Controller (MPC).
 ## Architecture
 
 ```
-┌──────────────────────────────────────┐   WiFi (RoboNet)   ┌──────────────────────────────┐
-│  Laptop — 10.10.0.1                  │ ←── /vision_state ──│  Jetson Nano — 10.10.0.100   │
-│  ROS2 Humble (Docker)                │                      │  ROS2 Foxy                   │
-│                                      │ ──── /cmd_vel ──────→│                              │
-│  puzzlebot_control                   │                      │  puzzlebot_perception        │
-│   ├── mpc_node           (MPC loop)  │                      │   └── vision_node            │
-│   └── visualizer_node   (live plots) │                      │       (GStreamer + HSV + CV)  │
-└──────────────────────────────────────┘                      └──────────────────────────────┘
+Laptop — 10.10.0.1                         RoboNet WiFi (10.10.0.0/24)       Jetson Nano — 10.10.0.100
+TP-Link USB hotspot (wlx105a95f6aa8d)  ←──────────────────────────────────→  Ubuntu 20.04, ROS2 Humble
+┌──────────────────────────────────┐                                          ┌──────────────────────────────────┐
+│  Docker: ros2_humble_dev         │  ←────── /vision_state (30 Hz) ───────  │  vision_node                     │
+│  ROS2 Humble                     │  ──────── /cmd_vel ────────────────────→ │   └─ IMX219 CSI (/dev/video0)    │
+│   mpc_node       (MPC solver)    │                                          │                                  │
+│   visualizer_node (live plots)   │                                          │  micro_ros_agent                 │
+└──────────────────────────────────┘                                          │   └─ /dev/ttyUSB0 default baud   │
+                                                                              │       └─ Puzzlebot motors/encoders│
+                                                                              └──────────────────────────────────┘
 ```
 
-Both machines share the `puzzlebot_msgs` package (compiled locally on each).
+Both machines build `puzzlebot_msgs` locally from the shared source.
 
 ---
 
@@ -25,10 +27,8 @@ Both machines share the `puzzlebot_msgs` package (compiled locally on each).
 ```
 puzzlebot-visual-servoing/
 ├── shared/puzzlebot_msgs/         # CMake — custom VisionState.msg
-├── jetson/puzzlebot_perception/   # Python — vision node (Foxy)
+├── jetson/puzzlebot_perception/   # Python — vision node (Humble/NVIDIA port)
 ├── laptop/puzzlebot_control/      # Python — MPC + visualizer (Humble)
-├── cyclonedds_laptop.xml          # DDS network config for laptop
-├── cyclonedds_jetson.xml          # DDS network config for Jetson
 ├── env_laptop.sh                  # source before launching on laptop
 └── env_jetson.sh                  # source before launching on Jetson
 ```
@@ -39,11 +39,8 @@ puzzlebot-visual-servoing/
 
 ### Both machines
 
-```bash
-sudo apt install ros-<distro>-rmw-cyclonedds-cpp
-```
-
-Replace `<distro>` with `humble` (laptop) or `foxy` (Jetson).
+`rmw_fastrtps_cpp` is the default RMW shipped with ROS2 — no extra apt install
+required on either machine.
 
 ### Laptop (Docker)
 
@@ -102,60 +99,109 @@ source install/setup.bash
 
 ---
 
-## 5. Network setup — ROS_DOMAIN_ID=42 via CycloneDDS
+## 5. Network setup — ROS_DOMAIN_ID=0
 
-Source the environment script **before** any `ros2` command.
+Both machines use `rmw_fastrtps_cpp` (the default ROS2 RMW — no extra install
+needed) and `ROS_DOMAIN_ID=0`. FastRTPS discovers peers via multicast on the
+shared subnet automatically.
 
-**On Jetson:**
-```bash
-source ~/dev_ws/src/control/puzzlebot-visual-servoing/env_jetson.sh
-```
-
-**On laptop (inside Docker):**
-```bash
-source /workspace/src/control/puzzlebot-visual-servoing/env_laptop.sh
-```
-
-These scripts export:
-- `ROS_DOMAIN_ID=42`
-- `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
-- `CYCLONEDDS_URI` pointing to the machine-specific XML config
-
-Verify discovery after launching both nodes:
+The Jetson workspace is `~/ros2_ws/`. The env script there sets the two
+required variables:
 
 ```bash
-ros2 topic list        # /vision_state and /cmd_vel should appear on both machines
-ros2 topic hz /vision_state
+# ~/ros2_ws/env_jetson.sh exports:
+#   ROS_DOMAIN_ID=0
+#   RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ```
+
+On the laptop the variables are set inline inside the Docker container (see
+Section 6).
 
 ---
 
-## 6. Run
+## 6. How to Run
 
-### Jetson — launch vision node
+Open four terminals in this order. The robot will not move until all four are
+running.
+
+---
+
+### Terminal 1 — Laptop: bring up RoboNet hotspot
 
 ```bash
-source ~/dev_ws/src/control/puzzlebot-visual-servoing/env_jetson.sh
-source ~/dev_ws/install/setup.bash
+nmcli con up "RoboNet"
+```
+
+The TP-Link USB adapter (`wlx105a95f6aa8d`) advertises the private WiFi network.
+The laptop becomes the gateway at `10.10.0.1`. Wait until the Jetson reconnects
+(ping `10.10.0.100` to confirm) before starting the remaining terminals.
+
+---
+
+### Terminal 2 — Jetson: start micro-ROS agent (motor bridge)
+
+```bash
+ssh puzzlebot@10.10.0.100
+source /opt/ros/humble/setup.bash
+source ~/ros2_packages_ws/install/setup.bash
+export ROS_DOMAIN_ID=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ROS_LOCALHOST_ONLY=0
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+ros2 run micro_ros_agent micro_ros_agent serial -D /dev/ttyUSB0 -v 6
+```
+
+This bridges the Puzzlebot's microcontroller, connected via USB serial, into
+ROS2 and exposes the wheel velocity topics.
+
+---
+
+### Terminal 3 — Jetson: start vision node
+
+```bash
+ssh puzzlebot@10.10.0.100
+source ~/ros2_ws/env_jetson.sh
+source ~/ros2_ws/install/setup.bash
 ros2 launch puzzlebot_perception perception.launch.py
 ```
 
-### Laptop — launch MPC + visualizer
+The IMX219 CSI camera (`/dev/video0`) opens via the GStreamer
+`nvarguscamerasrc` pipeline. The node publishes `/vision_state` at 30 Hz.
+If X11 forwarding is active (`ssh -X`), a "Robot View" preview window appears.
+
+---
+
+### Terminal 4 — Laptop Docker: start MPC controller
 
 ```bash
-source /workspace/src/control/puzzlebot-visual-servoing/env_laptop.sh
-source /workspace/install/setup.bash
+docker exec -it ros2_humble_dev bash
+source /tmp/puzzlebot_install/setup.bash
+export ROS_DOMAIN_ID=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ros2 launch puzzlebot_control control.launch.py
 ```
+
+The MPC node subscribes to `/vision_state`, solves the receding-horizon problem
+at 20 Hz, and publishes `/cmd_vel` back to the Jetson. The visualizer node
+opens live error and velocity plots if a display is available.
+
+---
+
+### Expected behaviour
+
+Place a red object in front of the camera. The robot centers the object
+horizontally (drives `e_x → 0`) and approaches until the contour area reaches
+`area_desired` (drives `e_area → 0`). Remove the object and the robot stops
+within `detection_timeout` seconds (default 0.5 s).
 
 ### Monitoring
 
 ```bash
-# Watch MPC diagnostics (JSON with e_x, e_area, v, omega, solve_ms)
+# JSON diagnostics: e_x, e_area, v, omega, solve_ms
 ros2 topic echo /mpc_debug
 
-# Plot errors with rqt (alternative to the built-in visualizer)
-ros2 run rqt_plot rqt_plot /mpc_debug
+# Verify cross-machine topic discovery
+ros2 topic hz /vision_state   # run from either machine
 ```
 
 ---
@@ -253,7 +299,71 @@ ros2 run puzzlebot_control mpc_node \
 
 ---
 
-## 10. Rubric compliance
+## 10. Troubleshooting
+
+**RoboNet hotspot drops mid-session**
+
+The USB WiFi adapter occasionally loses the connection profile. On the laptop:
+
+```bash
+nmcli con up "RoboNet"
+```
+
+---
+
+**Jetson doesn't reconnect to RoboNet after a reboot or hotspot restart**
+
+If the Jetson is unreachable over WiFi, connect it temporarily via Ethernet,
+SSH in, then bring the WiFi connection up manually:
+
+```bash
+ssh puzzlebot@<ethernet-ip>
+sudo nmcli con up RoboNet
+```
+
+After this the Jetson will auto-connect on future boots.
+
+---
+
+**Camera not detected (`Camera failed to open` in Terminal 3)**
+
+1. Check that the CSI ribbon cable is fully seated at both ends (camera and
+   carrier board connector).
+2. Verify the device exists: `ls /dev/video*` should show `/dev/video0`.
+3. If the device is missing after a confirmed-good cable, reboot the Jetson —
+   the CSI stack does not always recover without a full power cycle.
+
+---
+
+**RMW mismatch — nodes don't see each other's topics**
+
+Both machines must use the same middleware. Confirm with:
+
+```bash
+echo $RMW_IMPLEMENTATION   # must print rmw_fastrtps_cpp on both
+```
+
+If not set, export it before any `ros2` command:
+
+```bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+```
+
+---
+
+**SSH asks for a password every time**
+
+Copy your laptop's public key to the Jetson once:
+
+```bash
+ssh-copy-id puzzlebot@10.10.0.100
+```
+
+Subsequent `ssh` and `scp` commands will be passwordless.
+
+---
+
+## 11. Rubric compliance
 
 | Requirement                          | Implementation                                          |
 |--------------------------------------|---------------------------------------------------------|
@@ -262,4 +372,4 @@ ros2 run puzzlebot_control mpc_node \
 | Explicit constraints                 | `v ≥ 0`, `|ω| ≤ ω_max` enforced in grid construction   |
 | Optimal control formulation          | Receding-horizon MPC with interaction matrix model      |
 | End-to-end closed-loop demo          | vision_node → /vision_state → mpc_node → /cmd_vel      |
-| Cross-machine ROS2 communication     | CycloneDDS, ROS_DOMAIN_ID=42, multicast on RoboNet      |
+| Cross-machine ROS2 communication     | FastRTPS, ROS_DOMAIN_ID=0, multicast on RoboNet          |

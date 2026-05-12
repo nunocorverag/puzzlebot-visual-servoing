@@ -14,16 +14,20 @@ mpc_node:
     # ── Stage cost weights ───────────────────────────────────────────────────
     Qx: 10.0              # e_x stage penalty
     Qa:  1.0              # e_area stage penalty
-    Rv:  0.1              # linear velocity regularization
-    Ro:  0.1              # angular velocity regularization
+    Rv:  0.2              # linear velocity regularization
+    Ro:  0.2              # angular velocity regularization
 
     # ── Terminal cost weights (enforce convergence) ──────────────────────────
     Px: 50.0              # e_x terminal penalty
     Pa:  5.0              # e_area terminal penalty
 
     # ── Actuation limits ─────────────────────────────────────────────────────
-    v_max:     0.25       # maximum linear velocity  [m/s]
-    omega_max: 0.5        # maximum angular velocity [rad/s]
+    v_max:     0.06       # maximum linear velocity  [m/s]
+    omega_max: 0.20       # maximum angular velocity [rad/s]
+
+    # ── Command smoothing ───────────────────────────────────────────────────
+    max_v_step:     0.015 # max linear velocity change per control tick [m/s]
+    max_omega_step: 0.05  # max angular velocity change per control tick [rad/s]
 
     # ── Grid resolution ──────────────────────────────────────────────────────
     v_candidates:     7   # number of v samples in [0, v_max]

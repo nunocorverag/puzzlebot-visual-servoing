@@ -12,10 +12,10 @@ def generate_launch_description():
 
     return LaunchDescription([
         # ── Network — must match the Jetson ─────────────────────────────────
-        SetEnvironmentVariable('ROS_DOMAIN_ID',      '42'),
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp'),
-        # Set CYCLONEDDS_URI before calling ros2 launch:
-        #   source /path/to/env_laptop.sh && ros2 launch puzzlebot_control control.launch.py
+        SetEnvironmentVariable('ROS_DOMAIN_ID',      '0'),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
+        # Source env_laptop.sh before calling ros2 launch to set ROS_DOMAIN_ID.
 
         Node(
             package='puzzlebot_control',

@@ -1,0 +1,23 @@
+hsv_lower: [0, 80, 61]
+hsv_upper: [25, 255, 255]
+min_contour_area: 500.0
+use_shape_filter: true
+hard_shape_filter: true
+circularity_min: 0.38
+min_circularity_soft: 0.35
+aspect_ratio_min: 0.65
+aspect_ratio_max: 1.55
+min_fill_ratio: 0.35
+max_fill_ratio: 1.15
+area_score_weight: 0.10
+shape_score_weight: 0.65
+aspect_score_weight: 0.20
+fill_score_weight: 0.20
+center_score_weight: 0.05
+min_detection_score: 0.55
+confirm_frames: 3
+lost_frames: 4
+ex_smoothing_alpha: 0.35
+area_smoothing_alpha: 0.35
+ex_deadband: 0.05
+show_debug_view: true

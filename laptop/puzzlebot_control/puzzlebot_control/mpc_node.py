@@ -14,11 +14,11 @@ STATE  s = [e_x, e_area]ᵀ
              positive when target is closer than desired
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 INTERACTION MATRIX (linearized, decoupled approximation):
-  ė_x    ≈ -ω          angular rate directly rotates the centroid
+  ė_x    ≈  ω          ROS +ω turns left; positive image error needs right turn
   ė_area ≈  Kv · v     forward speed scales area toward desired
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DISCRETE MODEL (Euler, step dt):
-  e_x[k+1]    = e_x[k]    − dt · ω[k]
+  e_x[k+1]    = e_x[k]    + dt · ω[k]
   e_area[k+1] = e_area[k] + dt · Kv · v[k]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COST FUNCTION (horizon N):
@@ -105,7 +105,7 @@ class MPCController:
             cost += self.Qx * ex**2 + self.Qa * ea**2
             cost += self.Rv * v**2  + self.Ro * o**2
             # Discrete-time interaction matrix (Euler step)
-            ex = ex - self.dt * o
+            ex = ex + self.dt * o
             ea = ea + self.dt * self.Kv * v
 
         # Terminal penalty — larger weights to enforce convergence
@@ -130,21 +130,27 @@ class MPCNode(Node):
         self.declare_parameter('Kv',                0.3)    # area interaction gain
         self.declare_parameter('Qx',                10.0)
         self.declare_parameter('Qa',                1.0)
-        self.declare_parameter('Rv',                0.1)
-        self.declare_parameter('Ro',                0.1)
+        self.declare_parameter('Rv',                0.2)
+        self.declare_parameter('Ro',                0.2)
         self.declare_parameter('Px',                50.0)   # terminal weight e_x
         self.declare_parameter('Pa',                5.0)    # terminal weight e_area
-        self.declare_parameter('v_max',             0.25)   # m/s
-        self.declare_parameter('omega_max',         0.5)    # rad/s
+        self.declare_parameter('v_max',             0.06)   # m/s
+        self.declare_parameter('omega_max',         0.20)   # rad/s
         self.declare_parameter('v_candidates',      7)
         self.declare_parameter('omega_candidates',  11)
+        self.declare_parameter('max_v_step',        0.015)  # m/s per tick
+        self.declare_parameter('max_omega_step',    0.05)   # rad/s per tick
         self.declare_parameter('detection_timeout', 0.5)    # seconds
 
         self._area_d  = self.get_parameter('area_desired').value
         self._timeout = self.get_parameter('detection_timeout').value
+        self._max_v_step = float(self.get_parameter('max_v_step').value)
+        self._max_o_step = float(self.get_parameter('max_omega_step').value)
 
         self._latest_vs: Optional[VisionState] = None
         self._last_seen: float = 0.0
+        self._last_v: float = 0.0
+        self._last_omega: float = 0.0
 
         self._mpc = self._build_mpc()
 
@@ -195,6 +201,8 @@ class MPCNode(Node):
 
         if vs is None or not vs.object_detected or (now - self._last_seen) > self._timeout:
             self._pub_cmd.publish(Twist())  # safe stop
+            self._last_v = 0.0
+            self._last_omega = 0.0
             return
 
         e_x    = float(vs.ex)
@@ -203,11 +211,14 @@ class MPCNode(Node):
         t0             = time.perf_counter()
         v, omega, cost = self._mpc.solve(e_x, e_area)
         solve_ms       = (time.perf_counter() - t0) * 1_000.0
+        v, omega       = self._limit_command_step(v, omega)
 
         cmd           = Twist()
         cmd.linear.x  = v
         cmd.angular.z = omega
         self._pub_cmd.publish(cmd)
+        self._last_v = v
+        self._last_omega = omega
 
         diag = {
             'e_x':      round(e_x,     4),
@@ -218,6 +229,16 @@ class MPCNode(Node):
             'solve_ms': round(solve_ms, 2),
         }
         self._pub_diag.publish(String(data=json.dumps(diag)))
+
+    def _limit_command_step(self, v: float, omega: float) -> Tuple[float, float]:
+        v_min = self._last_v - self._max_v_step
+        v_max = self._last_v + self._max_v_step
+        o_min = self._last_omega - self._max_o_step
+        o_max = self._last_omega + self._max_o_step
+        return (
+            float(np.clip(v, v_min, v_max)),
+            float(np.clip(omega, o_min, o_max)),
+        )
 
 
 def main(args=None):

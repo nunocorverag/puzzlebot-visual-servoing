@@ -1,19 +1,41 @@
-# ROS2 build artifacts
+# ROS2 / colcon build artifacts
 build/
 install/
 log/
+.colcon/
+*.bag
+*.db3
+*.sqlite3
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .eggs/
 *.egg-info/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Local env and secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.jks
+secrets/
+keys/
