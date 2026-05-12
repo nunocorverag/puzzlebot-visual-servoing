@@ -5,6 +5,13 @@ use_shape_filter: true
 hard_shape_filter: true
 circularity_min: 0.38
 min_circularity_soft: 0.35
+target_min_circularity: 0.45
+target_min_circularity_soft: 0.35
+target_allow_ellipse: true
+target_ellipse_min_aspect_ratio: 0.45
+target_ellipse_max_aspect_ratio: 1.00
+target_min_fill_ratio: 0.45
+target_max_fill_ratio: 1.20
 aspect_ratio_min: 0.65
 aspect_ratio_max: 1.55
 min_fill_ratio: 0.35

@@ -1,5 +1,9 @@
 # Puzzlebot Visual Servoing Runbook
 
+For a high-level English description of the full system, see
+[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md). This runbook is the operational
+reference for setup, safety, tuning, diagnostics, and bench tests.
+
 Use `ROS_DOMAIN_ID=0` for this project. The micro-ROS motor topics from the
 Hackerboard are in domain 0, so Jetson vision and laptop/Docker control must
 also run in domain 0.
@@ -601,6 +605,29 @@ and partial semicircles while rejecting irregular orange background blobs.
 min_detection_score rejects low-confidence candidates before the robot moves.
 confirm_frames/lost_frames reduce one-frame flicker.
 ```
+
+Perspective target tuning:
+
+The `/vision_state` target detector accepts the red/orange circular target even
+when the sheet is tilted and the circle appears as an ellipse. It keeps the same
+HSV mask and `VisionState` message, but target candidates can pass either by
+circularity or by a valid fitted ellipse:
+
+```yaml
+target_min_circularity: 0.45
+target_min_circularity_soft: 0.35
+target_allow_ellipse: true
+target_ellipse_min_aspect_ratio: 0.45
+target_ellipse_max_aspect_ratio: 1.00
+target_min_fill_ratio: 0.45
+target_max_fill_ratio: 1.20
+```
+
+If the target disappears when the sheet is angled, lower
+`target_min_circularity_soft` to `0.30` or lower
+`target_ellipse_min_aspect_ratio` to `0.35`. If non-circular red/orange objects
+start being accepted as target, raise `target_min_circularity_soft` or
+`target_ellipse_min_aspect_ratio`.
 
 Then run vision:
 

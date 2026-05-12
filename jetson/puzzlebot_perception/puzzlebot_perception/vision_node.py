@@ -39,6 +39,13 @@ class VisionNode(Node):
         self.declare_parameter('hsv_upper', [25, 255, 255])
         self.declare_parameter('circularity_min', 0.38)
         self.declare_parameter('min_circularity_soft', 0.35)
+        self.declare_parameter('target_min_circularity', 0.45)
+        self.declare_parameter('target_min_circularity_soft', 0.35)
+        self.declare_parameter('target_allow_ellipse', True)
+        self.declare_parameter('target_ellipse_min_aspect_ratio', 0.45)
+        self.declare_parameter('target_ellipse_max_aspect_ratio', 1.00)
+        self.declare_parameter('target_min_fill_ratio', 0.45)
+        self.declare_parameter('target_max_fill_ratio', 1.20)
         self.declare_parameter('aspect_ratio_min', 0.65)
         self.declare_parameter('aspect_ratio_max', 1.55)
         self.declare_parameter('min_fill_ratio', 0.35)
@@ -254,14 +261,17 @@ class VisionNode(Node):
 
         use_shape_filter = bool(self.get_parameter('use_shape_filter').value)
         hard_shape_filter = bool(self.get_parameter('hard_shape_filter').value)
-        circularity_min = float(self.get_parameter('circularity_min').value)
-        min_circularity_soft = float(
-            self.get_parameter('min_circularity_soft').value
+        target_min_circularity = float(self.get_parameter('target_min_circularity').value)
+        target_min_circularity_soft = float(
+            self.get_parameter('target_min_circularity_soft').value
         )
+        target_allow_ellipse = bool(self.get_parameter('target_allow_ellipse').value)
+        ellipse_min = float(self.get_parameter('target_ellipse_min_aspect_ratio').value)
+        ellipse_max = float(self.get_parameter('target_ellipse_max_aspect_ratio').value)
         aspect_min = float(self.get_parameter('aspect_ratio_min').value)
         aspect_max = float(self.get_parameter('aspect_ratio_max').value)
-        min_fill = float(self.get_parameter('min_fill_ratio').value)
-        max_fill = float(self.get_parameter('max_fill_ratio').value)
+        min_fill = float(self.get_parameter('target_min_fill_ratio').value)
+        max_fill = float(self.get_parameter('target_max_fill_ratio').value)
         area_w = float(self.get_parameter('area_score_weight').value)
         shape_w = float(self.get_parameter('shape_score_weight').value)
         aspect_w = float(self.get_parameter('aspect_score_weight').value)
@@ -277,11 +287,22 @@ class VisionNode(Node):
             if metrics['area'] < self._min_area:
                 continue
             if use_shape_filter and hard_shape_filter:
-                if metrics['circularity'] < circularity_min:
+                if not (min_fill <= metrics['target_fill_ratio'] <= max_fill):
+                    metrics['reject_reason'] = 'TARGET_FILL'
                     continue
-                if not (aspect_min <= metrics['aspect_ratio'] <= aspect_max):
-                    continue
-                if not (min_fill <= metrics['fill_ratio'] <= max_fill):
+                legacy_aspect_ok = aspect_min <= metrics['aspect_ratio'] <= aspect_max
+                circle_ok = (
+                    metrics['circularity'] >= target_min_circularity
+                    and legacy_aspect_ok
+                )
+                ellipse_ok = (
+                    target_allow_ellipse
+                    and ellipse_min <= metrics['ellipse_ratio'] <= ellipse_max
+                    and metrics['circularity'] >= target_min_circularity_soft
+                    and not self._looks_like_red_box_target_candidate(metrics)
+                )
+                if not (circle_ok or ellipse_ok):
+                    metrics['reject_reason'] = 'TARGET_SHAPE'
                     continue
             candidates.append((contour, metrics))
 
@@ -289,7 +310,7 @@ class VisionNode(Node):
             return 0.0, 0.0, False, None, None
 
         scored = self._score_candidates(
-            candidates, min_circularity_soft, min_fill, max_fill,
+            candidates, target_min_circularity_soft, min_fill, max_fill,
             area_w, shape_w, aspect_w, fill_w, center_w
         )
         _, best, metrics = scored[0]
@@ -330,7 +351,7 @@ class VisionNode(Node):
                 / (1.0 - min_circularity_soft)
             )
             aspect_score = 1.0 - min(abs(metrics['aspect_ratio'] - 1.0), 1.0)
-            fill_score = self._fill_score(metrics['fill_ratio'], min_fill, max_fill)
+            fill_score = self._fill_score(metrics['target_fill_ratio'], min_fill, max_fill)
             center_score = 1.0 - min(abs(ex), 1.0)
             total_score = (
                 area_w * area_score
@@ -350,6 +371,15 @@ class VisionNode(Node):
             })
             scored.append((total_score, contour, metrics))
         return sorted(scored, key=lambda item: item[0], reverse=True)
+
+    def _looks_like_red_box_target_candidate(self, metrics: dict) -> bool:
+        # A real tilted circle has a smooth contour. A red floor box usually
+        # approximates to a filled quadrilateral and should stay out of /vision_state.
+        return (
+            int(metrics.get('approx_vertices', 0)) <= 5
+            and float(metrics.get('target_fill_ratio', 0.0)) >= 0.80
+            and float(metrics.get('bbox_aspect_ratio', 1.0)) < 0.75
+        )
 
     @staticmethod
     def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -373,6 +403,24 @@ class VisionNode(Node):
         aspect_ratio = float(w / h) if h > 0 else 0.0
         rect_area = float(w * h)
         extent = area / rect_area if rect_area > 0.0 else 0.0
+        bbox_aspect_ratio = (
+            float(min(w, h) / max(w, h)) if max(w, h) > 0 else 0.0
+        )
+        ellipse_ratio = bbox_aspect_ratio
+        ellipse_axes = None
+        approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True) if perimeter > 0.0 else contour
+        if len(contour) >= 5:
+            try:
+                (_, _), axes, _ = cv2.fitEllipse(contour)
+                axis_a = float(axes[0])
+                axis_b = float(axes[1])
+                max_axis = max(axis_a, axis_b)
+                min_axis = min(axis_a, axis_b)
+                if max_axis > 0.0:
+                    ellipse_ratio = min_axis / max_axis
+                    ellipse_axes = (axis_a, axis_b)
+            except cv2.error:
+                ellipse_axes = None
         (_, _), radius = cv2.minEnclosingCircle(contour)
         circle_area = math.pi * radius * radius
         fill_ratio = area / circle_area if circle_area > 0.0 else 0.0
@@ -386,8 +434,13 @@ class VisionNode(Node):
             'circularity': circularity,
             'rect': (x, y, w, h),
             'aspect_ratio': aspect_ratio,
+            'bbox_aspect_ratio': bbox_aspect_ratio,
+            'ellipse_ratio': float(ellipse_ratio),
+            'ellipse_axes': ellipse_axes,
+            'approx_vertices': int(len(approx)),
             'radius': float(radius),
             'fill_ratio': float(fill_ratio),
+            'target_fill_ratio': float(extent),
             'extent': float(extent),
             'centroid': (M['m10'] / M['m00'], M['m01'] / M['m00']),
         }
@@ -1060,8 +1113,9 @@ class VisionNode(Node):
             cv2.putText(
                 preview,
                 f"area={metrics['area']:.0f} circ={metrics['circularity']:.2f} "
-                f"ar={metrics['aspect_ratio']:.2f} fill={metrics['fill_ratio']:.2f} "
-                f"score={metrics.get('total_score', 0.0):.2f}",
+                f"ell={metrics.get('ellipse_ratio', 0.0):.2f} "
+                f"ar={metrics['aspect_ratio']:.2f} fill={metrics['target_fill_ratio']:.2f} "
+                f"vtx={metrics.get('approx_vertices', 0)} score={metrics.get('total_score', 0.0):.2f}",
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -1073,7 +1127,10 @@ class VisionNode(Node):
             cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 0, 255), 2)
             cv2.putText(
                 preview,
-                f"REJECTED score={metrics.get('total_score', 0.0):.2f}",
+                f"REJECTED {metrics.get('reject_reason', '')} "
+                f"circ={metrics.get('circularity', 0.0):.2f} "
+                f"ell={metrics.get('ellipse_ratio', 0.0):.2f} "
+                f"fill={metrics.get('target_fill_ratio', 0.0):.2f}",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
