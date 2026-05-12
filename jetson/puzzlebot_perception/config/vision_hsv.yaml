@@ -21,3 +21,12 @@ ex_smoothing_alpha: 0.35
 area_smoothing_alpha: 0.35
 ex_deadband: 0.05
 show_debug_view: true
+enable_blue_obstacle_detection: true
+blue_h_min: 90
+blue_h_max: 135
+blue_s_min: 40
+blue_s_max: 255
+blue_v_min: 20
+blue_v_max: 255
+blue_min_area: 800.0
+blue_close_area: 2500.0

@@ -13,12 +13,15 @@ Classical CV pipeline:
 Published:
   /vision_state  [puzzlebot_msgs/VisionState]
 """
+import json
+import time
 import rclpy
 from rclpy.node import Node
 import cv2
 import math
 import numpy as np
 from puzzlebot_msgs.msg import VisionState
+from std_msgs.msg import String
 
 
 class VisionNode(Node):
@@ -54,6 +57,15 @@ class VisionNode(Node):
         self.declare_parameter('area_smoothing_alpha', 0.35)
         self.declare_parameter('ex_deadband', 0.05)
         self.declare_parameter('show_debug_view', True)
+        self.declare_parameter('enable_blue_obstacle_detection', True)
+        self.declare_parameter('blue_h_min', 90)
+        self.declare_parameter('blue_h_max', 135)
+        self.declare_parameter('blue_s_min', 40)
+        self.declare_parameter('blue_s_max', 255)
+        self.declare_parameter('blue_v_min', 20)
+        self.declare_parameter('blue_v_max', 255)
+        self.declare_parameter('blue_min_area', 800.0)
+        self.declare_parameter('blue_close_area', 2500.0)
         # Legacy red parameters are kept so old launch overrides do not fail.
         self.declare_parameter('hsv_lower1', [0,   100, 80])   # low-hue red
         self.declare_parameter('hsv_upper1', [10,  255, 255])
@@ -74,6 +86,9 @@ class VisionNode(Node):
         self._smooth_ex = 0.0
         self._smooth_area = 0.0
         self._last_metrics = None
+        self._camera_available = False
+        self._frame_fail_count = 0
+        self._last_camera_error_log = 0.0
 
         # ── Camera ──────────────────────────────────────────────────────────────
         if self.get_parameter('use_gstreamer').value:
@@ -96,14 +111,22 @@ class VisionNode(Node):
             self._cap.set(cv2.CAP_PROP_FPS, fps)
 
         if not self._cap.isOpened():
-            self.get_logger().error('Camera failed to open — check GStreamer pipeline')
-            raise RuntimeError('Camera unavailable')
+            self.get_logger().error(
+                'Camera failed to open — check GStreamer pipeline or nvargus-daemon. '
+                'Vision node will continue publishing object_detected=false.'
+            )
+            self._camera_available = False
+        else:
+            self._camera_available = True
 
         # ── Morphological kernel reused every frame ───────────────────────────
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 
         # ── Publisher ────────────────────────────────────────────────────────────
         self._pub = self.create_publisher(VisionState, '/vision_state', 10)
+        self._pub_obstacle = self.create_publisher(
+            String, '/vision_obstacle_debug', 10
+        )
 
         self.create_timer(1.0 / fps, self._process_frame)
         self.get_logger().info(
@@ -114,19 +137,34 @@ class VisionNode(Node):
     # ── Pipeline steps ────────────────────────────────────────────────────────
 
     def _process_frame(self) -> None:
-        ret, frame = self._cap.read()
-        if not ret:
-            self.get_logger().warn('Frame read failed', throttle_duration_sec=2.0)
+        if not self._camera_available:
             self._publish(0.0, 0.0, False)
             return
 
+        ret, frame = self._cap.read()
+        if not ret:
+            self._frame_fail_count += 1
+            now = time.time()
+            if (now - self._last_camera_error_log) >= 5.0:
+                self.get_logger().warn(
+                    f'Frame read failed (count={self._frame_fail_count}). '
+                    f'Check camera connection or restart nvargus-daemon.',
+                    throttle_duration_sec=5.0
+                )
+                self._last_camera_error_log = now
+            self._publish(0.0, 0.0, False)
+            return
+
+        self._frame_fail_count = 0
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = self._segment(hsv)
         mask = self._clean(mask)
         ex, area, detected, contour, metrics = self._measure(mask)
+        blue_debug = self._detect_blue_obstacles(hsv)
+        self._publish_blue_obstacle_debug(blue_debug)
         ex, area, detected = self._apply_temporal_filter(ex, area, detected, metrics)
         self._publish(ex, area, detected)
-        self._show_preview(frame, ex, detected, contour, metrics)
+        self._show_preview(frame, ex, detected, contour, metrics, blue_debug)
 
     def _segment(self, hsv: 'np.ndarray') -> 'np.ndarray':
         """Single configurable HSV threshold for orange/terracotta targets."""
@@ -333,8 +371,79 @@ class VisionNode(Node):
         msg.object_detected = detected
         self._pub.publish(msg)
 
+    def _detect_blue_obstacles(self, hsv: 'np.ndarray') -> dict:
+        if not bool(self.get_parameter('enable_blue_obstacle_detection').value):
+            return self._empty_blue_debug()
+
+        lower = np.array([
+            int(self.get_parameter('blue_h_min').value),
+            int(self.get_parameter('blue_s_min').value),
+            int(self.get_parameter('blue_v_min').value),
+        ], dtype=np.uint8)
+        upper = np.array([
+            int(self.get_parameter('blue_h_max').value),
+            int(self.get_parameter('blue_s_max').value),
+            int(self.get_parameter('blue_v_max').value),
+        ], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = self._clean(mask)
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        min_area = float(self.get_parameter('blue_min_area').value)
+        close_area = float(self.get_parameter('blue_close_area').value)
+        candidates = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            M = cv2.moments(contour)
+            if M['m00'] == 0.0:
+                continue
+            cx = M['m10'] / M['m00']
+            cy = M['m01'] / M['m00']
+            ex = (cx - self._cx_image) / max(self._cx_image, 1.0)
+            candidates.append({
+                'area': area,
+                'bbox': [int(x), int(y), int(w), int(h)],
+                'centroid': [float(cx), float(cy)],
+                'ex': float(ex),
+            })
+
+        if not candidates:
+            return self._empty_blue_debug()
+
+        candidates.sort(key=lambda item: item['area'], reverse=True)
+        best = candidates[0]
+        return {
+            'blue_obstacle_detected': True,
+            'blue_obstacle_close': bool(best['area'] >= close_area),
+            'blue_obstacle_area': float(best['area']),
+            'blue_obstacle_ex': float(best['ex']),
+            'blue_obstacle_bbox': best['bbox'],
+            'blue_obstacle_count': len(candidates),
+            'blue_obstacles': candidates[:5],
+        }
+
+    @staticmethod
+    def _empty_blue_debug() -> dict:
+        return {
+            'blue_obstacle_detected': False,
+            'blue_obstacle_close': False,
+            'blue_obstacle_area': 0.0,
+            'blue_obstacle_ex': 0.0,
+            'blue_obstacle_bbox': [],
+            'blue_obstacle_count': 0,
+            'blue_obstacles': [],
+        }
+
+    def _publish_blue_obstacle_debug(self, blue_debug: dict) -> None:
+        self._pub_obstacle.publish(String(data=json.dumps(blue_debug)))
+
     def _show_preview(
-        self, frame: 'np.ndarray', ex: float, detected: bool, contour, metrics
+        self, frame: 'np.ndarray', ex: float, detected: bool, contour, metrics,
+        blue_debug: dict
     ) -> None:
         if not self._show_debug or self._debug_failed:
             return
@@ -376,6 +485,22 @@ class VisionNode(Node):
         else:
             cv2.putText(preview, 'SEARCHING...', (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2)
+
+        for obstacle in blue_debug.get('blue_obstacles', []):
+            x, y, w, h = obstacle['bbox']
+            close = bool(obstacle['area'] >= float(self.get_parameter('blue_close_area').value))
+            thickness = 3 if close else 2
+            label = 'BLUE_OBS_CLOSE' if close else 'BLUE_OBS'
+            cv2.rectangle(preview, (x, y), (x + w, y + h), (255, 0, 0), thickness)
+            cv2.putText(
+                preview,
+                f"{label} area={obstacle['area']:.0f}",
+                (x, max(y - 8, 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2,
+            )
         try:
             cv2.imshow('Robot View', preview)
             cv2.waitKey(1)

@@ -35,6 +35,64 @@ mpc_node:
 
     # ── Safety ───────────────────────────────────────────────────────────────
     detection_timeout: 0.5  # stop robot if no detection for this many seconds
+    # CRITICAL: angular_sign should be 1.0 if MPC omega matches ROS convention.
+    # The MPC generates omega where positive = turn left (ROS REP-103).
+    # If robot turns OPPOSITE to target direction, flip this to -1.0.
+    # Current setting: 1.0 (MPC sign is correct, no inversion needed)
+    angular_sign: 1.0       # flip between 1.0/-1.0 if steering is reversed
+
+    # ── High-level FSM ──────────────────────────────────────────────────────
+    enable_controller: true
+
+    # SEARCH: rotate slowly when the target is not visible.
+    enable_search: true
+    search_omega: 0.08
+    search_direction: 1.0
+    enable_acquire_state: true
+    acquire_hold_sec: 0.30
+    acquire_timeout_sec: 0.80
+    target_lost_grace_sec: 0.40
+    use_last_target_search_direction: false
+
+    # GOAL_REACHED: stop near the target using contour area as distance proxy.
+    enable_goal_stop: true
+    target_area_stop: 25000.0
+    target_area_resume: 18000.0
+
+    # AVOID: simple frontal obstacle avoidance using /LaserDistance.
+    enable_obstacle_avoidance: true
+    obstacle_topic: "/LaserDistance"
+    vision_obstacle_topic: "/vision_obstacle_debug"
+    obstacle_distance_scale: 1.0
+    obstacle_stop_distance: 0.12
+    obstacle_avoid_distance: 0.30
+    obstacle_clear_distance: 0.40
+    obstacle_timeout_sec: 1.0
+    avoid_omega: 0.14
+    avoid_direction: 1.0
+    avoid_forward_speed: 0.02
+    avoid_reverse_speed: 0.0
+
+    # Debug topics/logs.
+    publish_debug: true
+    debug_log_period_sec: 1.0
+
+    # CSV black-box log.
+    enable_csv_log: true
+    csv_log_dir: "/tmp/puzzlebot_logs"
+    csv_log_prefix: "mpc_fsm_log"
+    csv_flush_every: 1
+
+    # Safe shutdown stop burst.
+    safety_zero_burst_count: 10
+    safety_zero_burst_dt: 0.05
+
+    # Emergency stop and hard safety limits.
+    emergency_stop_topic: "/emergency_stop"
+    enable_cmd_safety_clamp: true
+    hard_v_limit: 0.08      # absolute maximum linear velocity [m/s]
+    hard_omega_limit: 0.25  # absolute maximum angular velocity [rad/s]
+    enable_steering_sign_check: true  # warn if steering appears reversed
 
 visualizer_node:
   ros__parameters:

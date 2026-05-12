@@ -181,23 +181,32 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ros2 launch puzzlebot_control control.launch.py
 ```
 
-The MPC node subscribes to `/vision_state`, solves the receding-horizon problem
-at 20 Hz, and publishes `/cmd_vel` back to the Jetson. The visualizer node
-opens live error and velocity plots if a display is available.
+The MPC node subscribes to `/vision_state` and optional frontal `/LaserDistance`,
+runs the SEARCH/ACQUIRE_TARGET/TRACKING/GOAL_REACHED/AVOID FSM at 20 Hz, and publishes
+`/cmd_vel` back to the Jetson. The visualizer node opens live error and velocity
+plots if a display is available.
 
 ---
 
 ### Expected behaviour
 
-Place a red object in front of the camera. The robot centers the object
-horizontally (drives `e_x → 0`) and approaches until the contour area reaches
-`area_desired` (drives `e_area → 0`). Remove the object and the robot stops
-within `detection_timeout` seconds (default 0.5 s).
+Place the calibrated orange/terracotta circle in front of the camera. The robot
+centers the object horizontally (drives `e_x → 0`) and approaches until the
+contour area reaches `target_area_stop`, then holds `GOAL_REACHED`. Remove the
+object and the robot enters `SEARCH`, rotating slowly until the target returns.
+When the target appears during SEARCH, the robot holds `ACQUIRE_TARGET` briefly
+before TRACKING so it does not spin past the object.
+If a recent frontal `/LaserDistance` reading is below the obstacle threshold,
+the robot enters `AVOID` and turns in place before resuming SEARCH or TRACKING.
+The controller writes a CSV black-box log under `/tmp/puzzlebot_logs`, and the
+camera preview can also mark blue visual obstacles for debugging. Blue obstacle
+vision does not trigger AVOID yet; `/LaserDistance` remains the safety trigger.
 
 ### Monitoring
 
 ```bash
-# JSON diagnostics: e_x, e_area, v, omega, solve_ms
+# FSM state and JSON diagnostics: e_x, area, obstacle distance, v, omega, solve_ms
+ros2 topic echo /fsm_state
 ros2 topic echo /mpc_debug
 
 # Verify cross-machine topic discovery
