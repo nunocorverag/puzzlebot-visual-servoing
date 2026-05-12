@@ -134,6 +134,329 @@ Frame read failed
 
 **Note:** Vision node will continue running and publish `object_detected=false` if camera fails. This prevents control node from crashing but robot will enter SEARCH mode.
 
+### Target Behind Obstacle Maneuver
+
+The robot can intelligently bypass obstacles that are blocking the target.
+
+**How it works:**
+
+When the robot detects that the red circular target is behind/blocked by the red_box obstacle, it executes a 5-phase maneuver:
+
+1. **OBSTACLE_CONFIRM** (0.4s): Robot stops and confirms the situation
+   - Verifies target and obstacle are aligned (ex values within threshold)
+   - Checks obstacle is "close" (large area in image)
+   - Remembers target position before it was blocked
+
+2. **AVOID_TURN** (2.00s): Turn away from obstacle
+   - If obstacle is right → turn left (omega = 0.24 rad/s)
+   - If obstacle is left → turn right (omega = -0.24 rad/s)
+   - **Total rotation: ~27.5° (0.48 rad)**
+   - Very long duration and fast turn for wide clearance
+   - Remembers turn direction for later phases
+
+3. **AVOID_FORWARD** (2.60s): Move forward to bypass
+   - Forward speed: **0.08 m/s** (maximum safe speed)
+   - Curve during forward: omega = 0.04 rad/s (noticeable arc, ~6°)
+   - Very long duration to ensure complete bypass
+   - **Total forward distance ≈ 20.8 cm**
+   - Arc helps navigate around obstacle
+
+4. **POST_AVOID_TURN_BACK** (1.60s): Turn back toward target
+   - Turns opposite direction from initial turn
+   - Turn rate: 0.22 rad/s (very aggressive)
+   - **Total rotation: ~20.2° (0.35 rad)**
+   - Much longer duration for better reorientation
+   - Aims robot back toward where target should be
+
+5. **POST_AVOID_REACQUIRE** (up to 4.0s): Search for target
+   - Rotation speed: 0.14 rad/s (faster search)
+   - **Maximum search angle: ~32° (0.56 rad)**
+   - Extended timeout for thorough search
+   - If target found → resume TRACKING
+   - If obstacle blocks again → retry only after central/close obstacle confirmation
+   - If timeout → give up and enter SEARCH mode
+
+**Note on VERY aggressive parameters:**
+These values are tuned for maximum obstacle clearance while staying within safety limits. The maneuver is intentionally exaggerated to ensure the robot fully bypasses the obstacle without collision. 
+
+**Total maneuver duration:** 6.2s minimum, 10.2s maximum (with full reacquire)
+
+**Safety compliance:**
+- All omega values ≤ `hard_omega_limit: 0.25 rad/s` ✓
+- All velocity values ≤ `hard_v_limit: 0.08 m/s` ✓
+- Commands are clamped by safety layer in code
+
+**If robot still collides:**
+Before increasing velocities further, first try increasing `target_behind_forward_sec` to 3.0 or 3.5 seconds. This increases bypass distance without exceeding speed limits.
+
+**Detection criteria:**
+
+Target behind obstacle is suspected when:
+- **Case A**: Both target and obstacle visible, aligned in image (ex difference < 0.35)
+- **Case B**: Target was seen recently (< 2.0s ago), obstacle appeared in same location
+
+**Parameters** (in `mpc_params.yaml`):
+```yaml
+enable_target_behind_obstacle_maneuver: true
+target_obstacle_confirm_sec: 0.4
+target_memory_sec: 2.0
+target_obstacle_ex_alignment_threshold: 0.35
+target_behind_obstacle_max_retries: 3
+# VERY aggressive maneuver values for maximum obstacle clearance:
+target_behind_avoid_turn_omega: 0.24       # ~27.5° turn
+target_behind_avoid_turn_sec: 2.00
+target_behind_forward_speed: 0.08          # max safe speed, ~20.8cm
+target_behind_forward_omega: 0.04          # ~6° arc
+target_behind_forward_sec: 2.60
+target_behind_turn_back_omega: 0.22        # ~20.2° turn
+target_behind_turn_back_sec: 1.60
+target_behind_reacquire_omega: 0.14        # ~32° max search
+target_behind_reacquire_timeout_sec: 4.0
+reacquire_obstacle_confirm_sec: 0.50
+reacquire_obstacle_confirm_frames: 5
+reacquire_obstacle_center_ex_limit: 0.55
+reacquire_obstacle_ignore_edge_ex: 0.70
+reacquire_obstacle_min_area_ratio: 0.75
+reacquire_obstacle_requires_close: true
+reacquire_obstacle_retry_cooldown_sec: 1.5
+ignore_edge_obstacles_during_reacquire: true
+```
+
+**POST_AVOID_REACQUIRE false-positive guard:**
+
+During `POST_AVOID_REACQUIRE`, the target has priority. If the red circular target is visible again, the maneuver clears and normal target acquisition/tracking resumes.
+
+Visual obstacles seen during reacquire do not restart AVOID immediately. They must be close, central/frontal, stable for `reacquire_obstacle_confirm_sec` or `reacquire_obstacle_confirm_frames`, and not in the edge zone. Obstacles with `abs(visual_obstacle_ex) >= reacquire_obstacle_ignore_edge_ex` are ignored during reacquire because they are likely side/border false positives and not directly blocking the path.
+
+Expected debug for false positives:
+```text
+reacquire_obstacle_confirmed: false
+visual_obstacle_edge_ignored: true       # if the obstacle is on an image edge
+visual_obstacle_in_path: false
+reacquire_obstacle_reason: obstacle_on_edge_ignored
+```
+
+Expected debug for a real retry obstacle:
+```text
+reacquire_obstacle_confirmed: true
+visual_obstacle_in_path: true
+reacquire_obstacle_reason: reacquire_obstacle_confirmed
+reacquire_obstacle_retry_allowed: true
+```
+
+If the retry cooldown has not elapsed, debug shows `reacquire_obstacle_retry_allowed: false` and the robot keeps reacquiring instead of starting a new loop.
+
+**Testing with wheels lifted:**
+
+1. Position target behind red_box obstacle
+2. Start demo with wheels lifted
+3. Monitor `/mpc_debug`:
+   ```bash
+   ros2 topic echo /mpc_debug | grep -A3 "target_behind"
+   ```
+4. Expected sequence:
+   - `target_behind_obstacle_suspected: true`
+   - `target_behind_obstacle_phase: "confirm"`
+   - `target_behind_obstacle_phase: "turn"`
+   - `target_behind_obstacle_phase: "forward"`
+   - `target_behind_obstacle_phase: "turn_back"`
+   - `target_behind_obstacle_phase: "reacquire"`
+
+5. Verify commands:
+   - Confirm: v=0, omega=0 (0.4s)
+   - Turn: v=0, omega=±0.24 (sign based on obstacle, 2.00s, ~27.5°)
+   - Forward: v=0.08, omega=0.04 (2.60s, travels ~20.8cm with ~6° arc)
+   - Turn back: v=0, omega=±0.22 (opposite sign, 1.60s, ~20.2°)
+   - Reacquire: v=0, omega=±0.14 (opposite to initial turn, up to 4.0s, ~32° max)
+
+**CSV diagnostics:**
+
+Check black box logs for maneuver details:
+```bash
+tail -50 /tmp/puzzlebot_logs/mpc_fsm_log_*.csv | grep -E "OBSTACLE_CONFIRM|AVOID_TURN|AVOID_FORWARD|POST_AVOID"
+```
+
+Key CSV fields:
+- `target_behind_obstacle_active`: Maneuver is running
+- `target_behind_obstacle_phase`: Current phase
+- `target_behind_obstacle_retry_count`: Number of retries
+- `last_target_behind_turn_direction`: +1 (left) or -1 (right)
+- `last_target_ex_before_obstacle`: Where target was before blocking
+- `last_obstacle_ex_before_avoid`: Where obstacle was detected
+- `reacquire_obstacle_confirmed`: True only after the reacquire guard confirms a real obstacle
+- `reacquire_obstacle_confirm_frames`: Consecutive reacquire obstacle frames
+- `reacquire_obstacle_seen_duration_sec`: How long the reacquire candidate has been stable
+- `reacquire_obstacle_reason`: Why reacquire accepted/ignored the visual obstacle
+- `visual_obstacle_edge_ignored`: True when an edge obstacle is ignored during reacquire
+- `visual_obstacle_in_path`: True when the visual obstacle is central/frontal and close
+- `reacquire_obstacle_retry_allowed`: False during retry cooldown
+
+**Safety notes:**
+
+- All phases respect `hard_v_limit` and `hard_omega_limit`
+- Emergency stop preempts maneuver immediately
+- Camera lost → WAIT_FOR_CAMERA (maneuver paused)
+- Laser obstacle too close → may trigger normal AVOID instead
+- Cooldown period (1.0s) between maneuvers prevents oscillation
+
+### Visual Obstacle Context-Aware Avoidance
+
+The robot uses intelligent logic to decide when to avoid visual obstacles (red_box).
+
+**Key principle:** Don't avoid obstacles that aren't blocking the path to the target.
+
+**Behavior in SEARCH mode:**
+
+When the robot is searching (rotating in place) and sees a red_box obstacle:
+
+- **Without target context**: Robot **ignores** the obstacle and continues searching
+  - Reason: No point avoiding if we don't know where the target is
+  - CSV: `visual_obstacle_ignored_in_search: true`
+  - Reason: `search_ignore_visual_obstacle_no_target`
+
+- **With recent target memory**: Robot checks alignment
+  - If obstacle is aligned with last known target position → **avoid or bypass**
+  - If obstacle is off to the side → **ignore and keep searching**
+
+- **With laser confirmation**: If `/LaserDistance` also detects obstacle close → **avoid**
+  - Reason: Physical safety overrides visual-only detection
+  - This prevents collisions even without target context
+
+**Behavior in TRACKING mode:**
+
+When robot is tracking the target and sees red_box:
+
+- **Obstacle blocks target** (ex difference < 0.30): **Activate bypass maneuver**
+  - CSV: `visual_obstacle_blocks_target: true`
+  - Reason: `visual_obstacle_blocks_visible_target`
+
+- **Obstacle off to the side**: **Ignore and continue tracking**
+  - CSV: `visual_obstacle_blocks_target: false`
+  - Reason: `visual_obstacle_not_blocking_visible_target`
+
+**LaserDistance always has priority:**
+
+- Laser obstacle detection works independently
+- If laser detects close obstacle → AVOID regardless of visual context
+- Provides physical safety layer
+
+**Parameters** (in `mpc_params.yaml`):
+```yaml
+visual_obstacle_avoid_requires_target_context: true
+ignore_visual_obstacle_during_search_without_target: true
+visual_obstacle_blocks_target_ex_threshold: 0.30
+visual_obstacle_allow_avoid_in_search_if_laser_close: true
+```
+
+**CSV diagnostics:**
+
+Key fields to check:
+- `visual_obstacle_requires_avoidance`: true if obstacle should be avoided
+- `visual_obstacle_avoidance_reason`: Explains why/why not
+- `visual_obstacle_ignored_in_search`: true if ignored during SEARCH
+- `visual_obstacle_blocks_target`: true if obstacle aligned with target
+- `visual_obstacle_target_ex_diff`: Horizontal distance between target and obstacle
+
+**Common scenarios:**
+
+1. **SEARCH, no target, see red_box:**
+   ```
+   state: SEARCH
+   visual_obstacle_detected: true
+   visual_obstacle_requires_avoidance: false
+   visual_obstacle_avoidance_reason: search_ignore_visual_obstacle_no_target
+   cmd_vel: {v: 0.0, omega: 0.08}  # Keep searching
+   ```
+
+2. **SEARCH, target was seen recently, red_box appears aligned:**
+   ```
+   state: SEARCH → OBSTACLE_CONFIRM
+   visual_obstacle_requires_avoidance: true
+   visual_obstacle_avoidance_reason: search_visual_obstacle_blocks_recent_target
+   target_behind_obstacle_suspected: true
+   ```
+
+3. **TRACKING, red_box off to the side:**
+   ```
+   state: TRACKING
+   visual_obstacle_detected: true
+   visual_obstacle_requires_avoidance: false
+   visual_obstacle_avoidance_reason: visual_obstacle_not_blocking_visible_target
+   visual_obstacle_target_ex_diff: 0.45  # Not aligned
+   cmd_vel: {v: 0.05, omega: -0.12}  # Keep tracking target
+   ```
+
+4. **TRACKING, red_box blocks target:**
+   ```
+   state: TRACKING → OBSTACLE_CONFIRM
+   visual_obstacle_requires_avoidance: true
+   visual_obstacle_avoidance_reason: visual_obstacle_blocks_visible_target
+   visual_obstacle_target_ex_diff: 0.12  # Aligned
+   target_behind_obstacle_suspected: true
+   ```
+
+### FSM Overlay in Camera Preview
+
+The camera preview window now displays the current FSM state received from the control node.
+
+**How it works:**
+
+The vision node subscribes to `/fsm_state` and displays the state in the bottom-left corner of the preview window with color coding:
+
+**State colors:**
+- **EMERGENCY_STOP**: Red
+- **WAIT_FOR_CAMERA**: Yellow
+- **SEARCH**: White
+- **TRACKING / ACQUIRE_TARGET / GOAL_REACHED**: Green
+- **AVOID / OBSTACLE_CONFIRM / AVOID_TURN / AVOID_FORWARD / POST_AVOID_TURN_BACK / POST_AVOID_REACQUIRE**: Orange
+- **STALE/UNKNOWN**: Gray (no messages received for > 1.0s)
+
+**Parameters** (in `vision_hsv.yaml`):
+```yaml
+show_fsm_state_overlay: true
+fsm_state_topic: "/fsm_state"
+fsm_state_stale_sec: 1.0
+```
+
+**Troubleshooting:**
+
+If you see `FSM: STALE/UNKNOWN` in the preview:
+
+1. Check if control node is publishing:
+   ```bash
+   ros2 topic echo /fsm_state
+   ```
+
+2. Check if topic exists:
+   ```bash
+   ros2 topic list | grep fsm
+   ```
+
+3. Verify ROS_DOMAIN_ID matches:
+   ```bash
+   echo $ROS_DOMAIN_ID  # Should be 0 for both laptop and Jetson
+   ```
+
+4. Check network connectivity between laptop and Jetson
+
+**Benefits:**
+
+- Visual debugging of target_behind_obstacle maneuver phases
+- Immediate feedback on robot state without checking terminal
+- Helps diagnose state transitions during testing
+- Useful for demos and presentations
+
+**Example states during maneuver:**
+
+When robot encounters target behind obstacle:
+1. `FSM: TRACKING` (green) → sees target
+2. `FSM: OBSTACLE_CONFIRM` (orange) → confirms obstacle blocks target
+3. `FSM: AVOID_TURN` (orange) → turning away
+4. `FSM: AVOID_FORWARD` (orange) → moving forward to bypass
+5. `FSM: POST_AVOID_TURN_BACK` (orange) → turning back
+6. `FSM: POST_AVOID_REACQUIRE` (orange) → searching for target
+7. `FSM: TRACKING` (green) → target reacquired
+
 ---
 
 ## One-command tmux demo

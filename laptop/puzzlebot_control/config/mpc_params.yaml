@@ -85,6 +85,11 @@ mpc_node:
     visual_avoid_default_direction: 1.0
     use_post_avoid_search_direction: true
     post_avoid_search_memory_sec: 2.0
+    # Visual obstacle context-aware avoidance: only avoid if obstacle blocks target
+    visual_obstacle_avoid_requires_target_context: true
+    ignore_visual_obstacle_during_search_without_target: true
+    visual_obstacle_blocks_target_ex_threshold: 0.30
+    visual_obstacle_allow_avoid_in_search_if_laser_close: true
 
     # Camera readiness gate: never search/track/avoid until vision is fresh.
     require_camera_ready: true
@@ -115,6 +120,40 @@ mpc_node:
     hard_v_limit: 0.08      # absolute maximum linear velocity [m/s]
     hard_omega_limit: 0.25  # absolute maximum angular velocity [rad/s]
     enable_steering_sign_check: true  # warn if steering appears reversed
+
+    # Target behind obstacle maneuver: intelligent bypass when target is blocked.
+    # This activates when the red circular target appears to be behind/blocked by
+    # the red_box obstacle. The robot will:
+    # 1. Confirm (stay still briefly to verify)
+    # 2. Turn away from obstacle
+    # 3. Move forward to bypass
+    # 4. Turn back toward expected target location
+    # 5. Search/reacquire target
+    enable_target_behind_obstacle_maneuver: true
+    target_obstacle_confirm_sec: 0.4           # confirmation hold time
+    target_obstacle_min_confirm_frames: 5      # min frames to confirm (not used yet)
+    target_memory_sec: 2.0                     # how long to remember last target
+    target_obstacle_ex_alignment_threshold: 0.35  # max ex difference to consider aligned
+    target_obstacle_requires_close: true       # obstacle must be "close" to trigger
+    target_behind_obstacle_cooldown_sec: 1.0   # cooldown between maneuvers
+    target_behind_obstacle_max_retries: 3      # max retry attempts
+    target_behind_avoid_turn_omega: 0.24       # turn rate during initial turn (VERY aggressive, ~27.5°)
+    target_behind_avoid_turn_sec: 3.64         # duration of initial turn (much longer, wide clearance)
+    target_behind_forward_speed: 0.08          # forward speed during bypass (max safe speed, ~20.8cm)
+    target_behind_forward_omega: 0.04          # curve during forward (noticeable arc, ~6°)
+    target_behind_forward_sec: 6.25            # duration of forward motion (very long to fully clear)
+    target_behind_turn_back_omega: 0.22        # turn rate when turning back (very aggressive, ~20.2°)
+    target_behind_turn_back_sec: 2.80          # duration of turn back (much longer)
+    target_behind_reacquire_omega: 0.14        # search rate during reacquire (faster, ~32° max)
+    target_behind_reacquire_timeout_sec: 6.0   # max time to search for target (extended search)
+    reacquire_obstacle_confirm_sec: 0.50       # obstacle must remain stable during reacquire
+    reacquire_obstacle_confirm_frames: 5       # or be seen this many reacquire cycles
+    reacquire_obstacle_center_ex_limit: 0.55   # only central/frontal obstacles can restart avoid
+    reacquire_obstacle_ignore_edge_ex: 0.70    # ignore edge false positives during reacquire
+    reacquire_obstacle_min_area_ratio: 0.75    # reject much smaller reacquire obstacles
+    reacquire_obstacle_requires_close: true    # only close obstacles can trigger retry
+    reacquire_obstacle_retry_cooldown_sec: 1.5 # avoid retry loops
+    ignore_edge_obstacles_during_reacquire: true
 
 visualizer_node:
   ros__parameters:

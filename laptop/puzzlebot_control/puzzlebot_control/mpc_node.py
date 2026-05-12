@@ -183,6 +183,10 @@ class MPCNode(Node):
         self.declare_parameter('visual_avoid_default_direction', 1.0)
         self.declare_parameter('use_post_avoid_search_direction', True)
         self.declare_parameter('post_avoid_search_memory_sec', 2.0)
+        self.declare_parameter('visual_obstacle_avoid_requires_target_context', True)
+        self.declare_parameter('ignore_visual_obstacle_during_search_without_target', True)
+        self.declare_parameter('visual_obstacle_blocks_target_ex_threshold', 0.30)
+        self.declare_parameter('visual_obstacle_allow_avoid_in_search_if_laser_close', True)
         self.declare_parameter('require_camera_ready', True)
         self.declare_parameter('camera_ready_timeout_sec', 1.0)
         self.declare_parameter('camera_startup_grace_sec', 0.5)
@@ -203,6 +207,31 @@ class MPCNode(Node):
         self.declare_parameter('hard_v_limit', 0.08)
         self.declare_parameter('hard_omega_limit', 0.25)
         self.declare_parameter('enable_steering_sign_check', True)
+        self.declare_parameter('enable_target_behind_obstacle_maneuver', True)
+        self.declare_parameter('target_obstacle_confirm_sec', 0.4)
+        self.declare_parameter('target_obstacle_min_confirm_frames', 5)
+        self.declare_parameter('target_memory_sec', 2.0)
+        self.declare_parameter('target_obstacle_ex_alignment_threshold', 0.35)
+        self.declare_parameter('target_obstacle_requires_close', True)
+        self.declare_parameter('target_behind_obstacle_cooldown_sec', 1.0)
+        self.declare_parameter('target_behind_obstacle_max_retries', 3)
+        self.declare_parameter('target_behind_avoid_turn_omega', 0.16)
+        self.declare_parameter('target_behind_avoid_turn_sec', 0.8)
+        self.declare_parameter('target_behind_forward_speed', 0.05)
+        self.declare_parameter('target_behind_forward_omega', 0.0)
+        self.declare_parameter('target_behind_forward_sec', 0.9)
+        self.declare_parameter('target_behind_turn_back_omega', 0.14)
+        self.declare_parameter('target_behind_turn_back_sec', 0.7)
+        self.declare_parameter('target_behind_reacquire_omega', 0.10)
+        self.declare_parameter('target_behind_reacquire_timeout_sec', 2.5)
+        self.declare_parameter('reacquire_obstacle_confirm_sec', 0.50)
+        self.declare_parameter('reacquire_obstacle_confirm_frames', 5)
+        self.declare_parameter('reacquire_obstacle_center_ex_limit', 0.55)
+        self.declare_parameter('reacquire_obstacle_ignore_edge_ex', 0.70)
+        self.declare_parameter('reacquire_obstacle_min_area_ratio', 0.75)
+        self.declare_parameter('reacquire_obstacle_requires_close', True)
+        self.declare_parameter('reacquire_obstacle_retry_cooldown_sec', 1.5)
+        self.declare_parameter('ignore_edge_obstacles_during_reacquire', True)
 
         self._area_d  = self.get_parameter('area_desired').value
         self._timeout = self.get_parameter('detection_timeout').value
@@ -250,6 +279,7 @@ class MPCNode(Node):
         self._last_avoid_turn_direction: float = 0.0
         self._last_avoid_end_time: float = 0.0
         self._last_visual_avoid_turn_direction: float = 0.0
+        self._last_visual_avoid_reason: str = ''
         self._last_search_direction_used: float = 0.0
         self._post_avoid_search_active: bool = False
         self._post_avoid_search_direction: float = 0.0
@@ -265,6 +295,31 @@ class MPCNode(Node):
         self._shutdown_burst_done: bool = False
         self._emergency_stop_active: bool = False
         self._last_steering_check_log: float = 0.0
+        self._target_behind_obstacle_active: bool = False
+        self._target_behind_obstacle_confirmed: bool = False
+        self._target_behind_obstacle_phase: str = 'none'
+        self._target_behind_obstacle_phase_start_time: float = 0.0
+        self._target_behind_obstacle_retry_count: int = 0
+        self._target_behind_obstacle_confirm_frames: int = 0
+        self._last_target_behind_turn_direction: float = 0.0
+        self._last_target_ex_before_obstacle: Optional[float] = None
+        self._last_target_area_before_obstacle: Optional[float] = None
+        self._last_target_seen_before_obstacle_time: float = 0.0
+        self._last_obstacle_ex_before_avoid: Optional[float] = None
+        self._last_obstacle_area_before_avoid: Optional[float] = None
+        self._last_target_behind_obstacle_end_time: float = 0.0
+        self._reacquire_obstacle_first_seen_time: float = 0.0
+        self._reacquire_obstacle_last_seen_time: float = 0.0
+        self._reacquire_obstacle_confirm_frames: int = 0
+        self._reacquire_obstacle_candidate_ex: float = 0.0
+        self._reacquire_obstacle_candidate_area: float = 0.0
+        self._last_reacquire_obstacle_retry_time: float = 0.0
+        self._last_reacquire_obstacle_reason: str = 'no_visual_obstacle'
+        self._last_reacquire_obstacle_confirmed: bool = False
+        self._last_visual_obstacle_edge_ignored: bool = False
+        self._last_visual_obstacle_in_path: bool = False
+        self._last_visual_obstacle_ignore_reason: str = ''
+        self._last_reacquire_obstacle_retry_allowed: bool = False
 
         self._mpc = self._build_mpc()
         self._init_csv_log()
@@ -381,7 +436,7 @@ class MPCNode(Node):
         laser_obstacle_active = self._obstacle_active(obstacle_available, d_obs)
         visual_status = self._visual_obstacle_status(now)
         avoid_active, avoid_source, avoid_turn_direction, avoid_v, avoid_omega = (
-            self._avoid_status(laser_obstacle_active, d_obs, visual_status)
+            self._avoid_status(laser_obstacle_active, d_obs, visual_status, now, self._state, detected, ex, area)
         )
         obstacle_active = avoid_active
         cost = None
@@ -425,6 +480,76 @@ class MPCNode(Node):
 
         self._camera_ready = True
         self._camera_was_ready = True
+
+        laser_in_stop_zone = (
+            laser_obstacle_active
+            and d_obs is not None
+            and d_obs < float(self.get_parameter('obstacle_stop_distance').value)
+        )
+        if laser_in_stop_zone:
+            state = 'AVOID'
+            v, omega = avoid_v, avoid_omega
+            self._last_avoid_source = avoid_source
+            self._last_visual_avoid_turn_direction = (
+                avoid_turn_direction if avoid_source in ('vision', 'both') else 0.0
+            )
+            self._publish_cmd(v, omega, state, smooth=False, transition_reason='laser_stop_zone_preempts_maneuver')
+            self._publish_debug(
+                state, ex, area, detected, last_target_age,
+                obstacle_available, obstacle_active, d_obs, obstacle_raw, obstacle_age,
+                v, omega
+            )
+            return
+
+        # ── Target behind obstacle maneuver ───────────────────────────────────────
+        target_behind_suspected, target_behind_confirmed_check, target_behind_reason = (
+            self._target_behind_obstacle_status(now, detected, ex, area, visual_status)
+        )
+
+        # Check if maneuver is already active
+        maneuver_state, maneuver_v, maneuver_omega, maneuver_reason = (
+            self._target_behind_obstacle_maneuver_command(now, detected, ex, area, visual_status)
+        )
+        if maneuver_reason in (
+            'target_reacquired_after_obstacle',
+            'target_behind_obstacle_give_up',
+            'max_retries_reached',
+        ):
+            target_behind_suspected = False
+
+        if maneuver_state is not None:
+            # Maneuver is active, execute it
+            self._publish_cmd(maneuver_v, maneuver_omega, maneuver_state, smooth=False, transition_reason=maneuver_reason)
+            self._publish_debug(
+                maneuver_state, ex, area, detected, last_target_age,
+                obstacle_available, obstacle_active, d_obs, obstacle_raw, obstacle_age,
+                maneuver_v, maneuver_omega
+            )
+            return
+
+        # Start maneuver if suspected and not in cooldown
+        if target_behind_suspected and not self._target_behind_obstacle_active:
+            cooldown_sec = float(self.get_parameter('target_behind_obstacle_cooldown_sec').value)
+            since_last_maneuver = now - self._last_target_behind_obstacle_end_time
+            if self._last_target_behind_obstacle_end_time <= 0.0 or since_last_maneuver >= cooldown_sec:
+                # Start confirmation phase
+                self._target_behind_obstacle_active = True
+                self._target_behind_obstacle_confirmed = False
+                self._target_behind_obstacle_phase = 'confirm'
+                self._target_behind_obstacle_phase_start_time = now
+                self._target_behind_obstacle_confirm_frames = 0
+                self._last_target_seen_before_obstacle_time = self._last_target_seen_time
+                
+                state = 'OBSTACLE_CONFIRM'
+                v, omega = 0.0, 0.0
+                self._publish_stop(state, 'target_obstacle_confirm_start')
+                self._publish_debug(
+                    state, ex, area, detected, last_target_age,
+                    obstacle_available, obstacle_active, d_obs, obstacle_raw, obstacle_age,
+                    v, omega, stop_commanded=True, stop_reason='target_obstacle_confirm_start',
+                    notes=target_behind_reason
+                )
+                return
 
         if avoid_active:
             state = 'AVOID'
@@ -752,18 +877,239 @@ class MPCNode(Node):
         default_direction = float(self.get_parameter('visual_avoid_default_direction').value)
         return 1.0 if default_direction >= 0.0 else -1.0
 
+    def _visual_obstacle_requires_avoidance(
+        self,
+        now: float,
+        state: str,
+        detected: bool,
+        ex: float,
+        area: float,
+        visual_status: Dict[str, Any],
+        laser_active: bool,
+    ) -> Tuple[bool, str]:
+        """
+        Determine if visual obstacle requires avoidance based on context.
+        Returns: (requires_avoidance, reason)
+        """
+        if not bool(self.get_parameter('visual_obstacle_avoid_requires_target_context').value):
+            # Legacy behavior: visual obstacle always triggers avoid if active
+            return bool(visual_status.get('active', False)), 'legacy_always_avoid'
+
+        visual_active = bool(visual_status.get('active', False))
+        if not visual_active:
+            return False, 'no_visual_obstacle'
+
+        obstacle_ex = float(visual_status.get('ex', 0.0))
+        ex_threshold = float(self.get_parameter('visual_obstacle_blocks_target_ex_threshold').value)
+
+        if self._target_behind_obstacle_phase == 'reacquire' or state == 'POST_AVOID_REACQUIRE':
+            in_path, reason = self._visual_obstacle_in_path(visual_status, 'reacquire')
+            self._last_visual_obstacle_in_path = in_path
+            self._last_visual_obstacle_edge_ignored = reason == 'obstacle_on_edge_ignored'
+            self._last_visual_obstacle_ignore_reason = '' if in_path else reason
+            return False, reason if not in_path else 'reacquire_waiting_for_obstacle_confirmation'
+
+        if self._visual_obstacle_is_edge_ignored(obstacle_ex) and state == 'SEARCH':
+            self._last_visual_obstacle_edge_ignored = True
+            self._last_visual_obstacle_in_path = False
+            self._last_visual_obstacle_ignore_reason = 'obstacle_on_edge_ignored'
+            return False, 'obstacle_on_edge_ignored'
+
+        # Special case: SEARCH without target
+        if state == 'SEARCH':
+            ignore_in_search = bool(
+                self.get_parameter('ignore_visual_obstacle_during_search_without_target').value
+            )
+            allow_if_laser = bool(
+                self.get_parameter('visual_obstacle_allow_avoid_in_search_if_laser_close').value
+            )
+            
+            # If laser is close, allow avoid even in SEARCH
+            if laser_active and allow_if_laser:
+                return True, 'search_laser_close_visual_confirm'
+            
+            # Check if target is stable/recent and aligned
+            target_memory_sec = float(self.get_parameter('target_memory_sec').value)
+            has_recent_target = (
+                self._last_target_seen_time > 0.0
+                and (now - self._last_target_seen_time) <= target_memory_sec
+            )
+            
+            if not has_recent_target and ignore_in_search:
+                return False, 'search_ignore_visual_obstacle_no_target'
+            
+            # Has recent target, check alignment
+            if has_recent_target and self._last_target_ex is not None:
+                ex_diff = abs(self._last_target_ex - obstacle_ex)
+                if ex_diff <= ex_threshold:
+                    return True, 'search_visual_obstacle_blocks_recent_target'
+                else:
+                    return False, 'search_visual_obstacle_not_aligned_with_target'
+            
+            # No target context, ignore if configured
+            if ignore_in_search:
+                return False, 'search_ignore_visual_obstacle_no_target_context'
+
+        # Check if target-behind-obstacle maneuver is suspected/active
+        if self._target_behind_obstacle_active or self._target_behind_obstacle_confirmed:
+            return True, 'target_behind_obstacle_maneuver_active'
+
+        # Check if target is currently visible and aligned with obstacle
+        if detected:
+            ex_diff = abs(ex - obstacle_ex)
+            self._last_visual_obstacle_in_path = ex_diff <= ex_threshold
+            if ex_diff <= ex_threshold:
+                return True, 'visual_obstacle_blocks_visible_target'
+            else:
+                return False, 'visual_obstacle_not_blocking_visible_target'
+
+        # Check if target was seen recently and obstacle is aligned
+        target_memory_sec = float(self.get_parameter('target_memory_sec').value)
+        if self._last_target_seen_time > 0.0:
+            target_age = now - self._last_target_seen_time
+            if target_age <= target_memory_sec and self._last_target_ex is not None:
+                ex_diff = abs(self._last_target_ex - obstacle_ex)
+                self._last_visual_obstacle_in_path = ex_diff <= ex_threshold
+                if ex_diff <= ex_threshold:
+                    return True, 'visual_obstacle_blocks_recent_target'
+                else:
+                    return False, 'visual_obstacle_not_aligned_with_recent_target'
+
+        # No target context, don't avoid
+        return False, 'visual_obstacle_not_blocking_target'
+
+    def _visual_obstacle_is_edge_ignored(self, obstacle_ex: float) -> bool:
+        if not bool(self.get_parameter('ignore_edge_obstacles_during_reacquire').value):
+            return False
+        edge_limit = abs(float(self.get_parameter('reacquire_obstacle_ignore_edge_ex').value))
+        return abs(float(obstacle_ex)) >= edge_limit
+
+    def _reset_reacquire_obstacle_confirmation(self, reason: str) -> None:
+        self._reacquire_obstacle_first_seen_time = 0.0
+        self._reacquire_obstacle_last_seen_time = 0.0
+        self._reacquire_obstacle_confirm_frames = 0
+        self._reacquire_obstacle_candidate_ex = 0.0
+        self._reacquire_obstacle_candidate_area = 0.0
+        self._last_reacquire_obstacle_reason = reason
+        self._last_reacquire_obstacle_confirmed = False
+        self._last_visual_obstacle_in_path = False
+
+    def _visual_obstacle_in_path(
+        self,
+        visual_status: Dict[str, Any],
+        context: str,
+        target_ex: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        if not bool(visual_status.get('active', False)):
+            return False, 'no_visual_obstacle'
+
+        obstacle_ex = float(visual_status.get('ex', 0.0))
+        obstacle_close = bool(visual_status.get('close', False))
+
+        if self._visual_obstacle_is_edge_ignored(obstacle_ex):
+            return False, 'obstacle_on_edge_ignored'
+
+        if context == 'reacquire':
+            if bool(self.get_parameter('reacquire_obstacle_requires_close').value) and not obstacle_close:
+                return False, 'obstacle_not_close'
+            center_limit = abs(float(self.get_parameter('reacquire_obstacle_center_ex_limit').value))
+            if abs(obstacle_ex) > center_limit:
+                return False, 'obstacle_not_in_path'
+            return True, 'obstacle_in_reacquire_path'
+
+        if context == 'tracking':
+            if not obstacle_close or target_ex is None:
+                return False, 'obstacle_not_close'
+            ex_threshold = float(self.get_parameter('visual_obstacle_blocks_target_ex_threshold').value)
+            if abs(float(target_ex) - obstacle_ex) <= ex_threshold:
+                return True, 'visual_obstacle_blocks_visible_target'
+            return False, 'visual_obstacle_not_blocking_visible_target'
+
+        return False, 'search_visual_obstacle_not_in_path'
+
+    def _reacquire_obstacle_confirmed(
+        self,
+        now: float,
+        visual_status: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        visual_active = bool(visual_status.get('active', False))
+        visual_detected = bool(visual_status.get('detected', False))
+        if not (visual_active or visual_detected):
+            self._last_visual_obstacle_edge_ignored = False
+            self._last_visual_obstacle_ignore_reason = ''
+            self._reset_reacquire_obstacle_confirmation('no_visual_obstacle')
+            return False, 'no_visual_obstacle'
+
+        obstacle_ex = float(visual_status.get('ex', 0.0))
+        obstacle_area = float(visual_status.get('area', 0.0))
+        self._reacquire_obstacle_candidate_ex = obstacle_ex
+        self._reacquire_obstacle_candidate_area = obstacle_area
+
+        in_path, path_reason = self._visual_obstacle_in_path(visual_status, 'reacquire')
+        self._last_visual_obstacle_in_path = in_path
+        self._last_visual_obstacle_edge_ignored = path_reason == 'obstacle_on_edge_ignored'
+        self._last_visual_obstacle_ignore_reason = '' if in_path else path_reason
+        if not in_path:
+            self._reset_reacquire_obstacle_confirmation(path_reason)
+            return False, path_reason
+
+        previous_area = self._last_obstacle_area_before_avoid
+        min_area_ratio = float(self.get_parameter('reacquire_obstacle_min_area_ratio').value)
+        if previous_area is not None and previous_area > 0.0:
+            area_ratio = obstacle_area / previous_area
+            if area_ratio < min_area_ratio:
+                reason = 'obstacle_area_too_small'
+                self._last_visual_obstacle_ignore_reason = reason
+                self._reset_reacquire_obstacle_confirmation(reason)
+                return False, reason
+
+        if self._reacquire_obstacle_first_seen_time <= 0.0:
+            self._reacquire_obstacle_first_seen_time = now
+            self._reacquire_obstacle_confirm_frames = 0
+        self._reacquire_obstacle_last_seen_time = now
+        self._reacquire_obstacle_confirm_frames += 1
+
+        seen_duration = now - self._reacquire_obstacle_first_seen_time
+        confirm_sec = float(self.get_parameter('reacquire_obstacle_confirm_sec').value)
+        confirm_frames = int(self.get_parameter('reacquire_obstacle_confirm_frames').value)
+        confirmed = (
+            seen_duration >= confirm_sec
+            or self._reacquire_obstacle_confirm_frames >= confirm_frames
+        )
+        if confirmed:
+            self._last_reacquire_obstacle_reason = 'reacquire_obstacle_confirmed'
+            self._last_reacquire_obstacle_confirmed = True
+            self._last_visual_obstacle_ignore_reason = ''
+            return True, 'reacquire_obstacle_confirmed'
+
+        self._last_reacquire_obstacle_reason = 'reacquire_ignore_unconfirmed_obstacle'
+        self._last_reacquire_obstacle_confirmed = False
+        return False, 'reacquire_ignore_unconfirmed_obstacle'
+
     def _avoid_status(
         self,
         laser_active: bool,
         distance: Optional[float],
         visual_status: Dict[str, Any],
+        now: float,
+        state: str,
+        detected: bool,
+        ex: float,
+        area: float,
     ) -> Tuple[bool, str, float, float, float]:
-        visual_active = bool(visual_status.get('active', False))
-        if laser_active and visual_active:
+        # Check if visual obstacle requires avoidance based on context
+        visual_requires_avoid, visual_avoid_reason = self._visual_obstacle_requires_avoidance(
+            now, state, detected, ex, area, visual_status, laser_active
+        )
+        
+        # Store reason for debugging
+        self._last_visual_avoid_reason = visual_avoid_reason
+        
+        if laser_active and visual_requires_avoid:
             source = 'both'
         elif laser_active:
             source = 'laser'
-        elif visual_active:
+        elif visual_requires_avoid:
             source = 'vision'
         else:
             return False, 'none', 0.0, 0.0, 0.0
@@ -848,6 +1194,211 @@ class MPCNode(Node):
                 if target_visible else 'both_obstacles_clear_no_target_search'
             )
         return 'obstacle_clear_target_visible' if target_visible else 'obstacle_clear_no_target_search'
+
+    def _target_behind_obstacle_status(
+        self,
+        now: float,
+        detected: bool,
+        ex: float,
+        area: float,
+        visual_status: Dict[str, Any],
+    ) -> Tuple[bool, bool, str]:
+        """
+        Detect if target is behind/blocked by visual obstacle.
+        Returns: (suspected, confirmed, reason)
+        """
+        if not bool(self.get_parameter('enable_target_behind_obstacle_maneuver').value):
+            return False, False, 'maneuver_disabled'
+
+        visual_detected = bool(visual_status.get('detected', False))
+        visual_close = bool(visual_status.get('close', False))
+        visual_ex = float(visual_status.get('ex', 0.0))
+        visual_area = float(visual_status.get('area', 0.0))
+
+        target_memory_sec = float(self.get_parameter('target_memory_sec').value)
+        ex_threshold = float(self.get_parameter('target_obstacle_ex_alignment_threshold').value)
+        requires_close = bool(self.get_parameter('target_obstacle_requires_close').value)
+
+        # Case A: Both visible and aligned
+        if detected and visual_detected:
+            if requires_close and not visual_close:
+                return False, False, 'obstacle_not_close'
+            
+            ex_diff = abs(ex - visual_ex)
+            if ex_diff < ex_threshold:
+                self._last_target_ex_before_obstacle = ex
+                self._last_target_area_before_obstacle = area
+                self._last_obstacle_ex_before_avoid = visual_ex
+                self._last_obstacle_area_before_avoid = visual_area
+                return True, False, 'both_visible_aligned'
+            return False, False, 'not_aligned'
+
+        # Case B: Target was seen recently, obstacle appeared
+        if not detected and visual_detected:
+            if requires_close and not visual_close:
+                return False, False, 'obstacle_not_close'
+            
+            if self._last_target_seen_time <= 0.0:
+                return False, False, 'no_target_memory'
+            
+            target_age = now - self._last_target_seen_time
+            if target_age > target_memory_sec:
+                return False, False, 'target_memory_expired'
+            
+            if self._last_target_ex is None:
+                return False, False, 'no_target_ex_memory'
+            
+            ex_diff = abs(self._last_target_ex - visual_ex)
+            if ex_diff < ex_threshold:
+                self._last_target_ex_before_obstacle = self._last_target_ex
+                self._last_obstacle_ex_before_avoid = visual_ex
+                self._last_obstacle_area_before_avoid = visual_area
+                return True, False, 'target_lost_obstacle_appeared'
+            return False, False, 'not_aligned_memory'
+
+        return False, False, 'no_conditions_met'
+
+    def _target_behind_obstacle_maneuver_command(
+        self,
+        now: float,
+        detected: bool,
+        ex: float,
+        area: float,
+        visual_status: Dict[str, Any],
+    ) -> Tuple[Optional[str], float, float, str]:
+        """
+        Execute target behind obstacle maneuver phases.
+        Returns: (state, v, omega, reason) or (None, 0, 0, '') if not active
+        """
+        if not self._target_behind_obstacle_active:
+            return None, 0.0, 0.0, ''
+
+        phase = self._target_behind_obstacle_phase
+        phase_elapsed = now - self._target_behind_obstacle_phase_start_time
+
+        # OBSTACLE_CONFIRM phase
+        if phase == 'confirm':
+            confirm_sec = float(self.get_parameter('target_obstacle_confirm_sec').value)
+            if phase_elapsed >= confirm_sec:
+                # Confirmation complete, start turn
+                self._target_behind_obstacle_confirmed = True
+                self._target_behind_obstacle_phase = 'turn'
+                self._target_behind_obstacle_phase_start_time = now
+                
+                # Decide turn direction based on obstacle position
+                if self._last_obstacle_ex_before_avoid is not None:
+                    if self._last_obstacle_ex_before_avoid > 0.0:
+                        self._last_target_behind_turn_direction = -1.0  # obstacle right, turn left
+                    else:
+                        self._last_target_behind_turn_direction = 1.0   # obstacle left, turn right
+                else:
+                    default_dir = float(self.get_parameter('visual_avoid_default_direction').value)
+                    self._last_target_behind_turn_direction = default_dir
+                
+                return 'OBSTACLE_CONFIRM', 0.0, 0.0, 'target_obstacle_confirmed'
+            
+            return 'OBSTACLE_CONFIRM', 0.0, 0.0, 'target_obstacle_confirm_hold'
+
+        # AVOID_TURN phase
+        elif phase == 'turn':
+            turn_sec = float(self.get_parameter('target_behind_avoid_turn_sec').value)
+            if phase_elapsed >= turn_sec:
+                self._target_behind_obstacle_phase = 'forward'
+                self._target_behind_obstacle_phase_start_time = now
+                return 'AVOID_TURN', 0.0, 0.0, 'target_behind_avoid_turn_complete'
+            
+            turn_omega = float(self.get_parameter('target_behind_avoid_turn_omega').value)
+            omega = self._last_target_behind_turn_direction * turn_omega
+            return 'AVOID_TURN', 0.0, omega, 'target_behind_avoid_turn'
+
+        # AVOID_FORWARD phase
+        elif phase == 'forward':
+            forward_sec = float(self.get_parameter('target_behind_forward_sec').value)
+            if phase_elapsed >= forward_sec:
+                self._target_behind_obstacle_phase = 'turn_back'
+                self._target_behind_obstacle_phase_start_time = now
+                return 'AVOID_FORWARD', 0.0, 0.0, 'target_behind_forward_complete'
+            
+            forward_v = float(self.get_parameter('target_behind_forward_speed').value)
+            forward_omega = float(self.get_parameter('target_behind_forward_omega').value)
+            omega = self._last_target_behind_turn_direction * forward_omega
+            return 'AVOID_FORWARD', forward_v, omega, 'target_behind_forward_clear'
+
+        # POST_AVOID_TURN_BACK phase
+        elif phase == 'turn_back':
+            turn_back_sec = float(self.get_parameter('target_behind_turn_back_sec').value)
+            if phase_elapsed >= turn_back_sec:
+                self._target_behind_obstacle_phase = 'reacquire'
+                self._target_behind_obstacle_phase_start_time = now
+                return 'POST_AVOID_TURN_BACK', 0.0, 0.0, 'target_behind_turn_back_complete'
+            
+            turn_back_omega = float(self.get_parameter('target_behind_turn_back_omega').value)
+            omega = -self._last_target_behind_turn_direction * turn_back_omega
+            return 'POST_AVOID_TURN_BACK', 0.0, omega, 'target_behind_turn_back'
+
+        # POST_AVOID_REACQUIRE phase
+        elif phase == 'reacquire':
+            # Check if target reappeared
+            if detected:
+                self._clear_target_behind_obstacle_maneuver()
+                return None, 0.0, 0.0, 'target_reacquired_after_obstacle'
+
+            confirmed, obstacle_reason = self._reacquire_obstacle_confirmed(now, visual_status)
+            if confirmed:
+                self._last_visual_avoid_reason = 'reacquire_obstacle_confirmed'
+                retry_cooldown = float(self.get_parameter('reacquire_obstacle_retry_cooldown_sec').value)
+                retry_age = now - self._last_reacquire_obstacle_retry_time
+                retry_allowed = (
+                    self._last_reacquire_obstacle_retry_time <= 0.0
+                    or retry_age >= retry_cooldown
+                )
+                self._last_reacquire_obstacle_retry_allowed = retry_allowed
+                if not retry_allowed:
+                    reacquire_omega = float(self.get_parameter('target_behind_reacquire_omega').value)
+                    omega = -self._last_target_behind_turn_direction * reacquire_omega
+                    return 'POST_AVOID_REACQUIRE', 0.0, omega, 'reacquire_obstacle_retry_cooldown'
+
+                max_retries = int(self.get_parameter('target_behind_obstacle_max_retries').value)
+                if self._target_behind_obstacle_retry_count >= max_retries:
+                    self._clear_target_behind_obstacle_maneuver()
+                    return None, 0.0, 0.0, 'max_retries_reached'
+
+                self._target_behind_obstacle_retry_count += 1
+                self._target_behind_obstacle_phase = 'confirm'
+                self._target_behind_obstacle_phase_start_time = now
+                self._target_behind_obstacle_confirm_frames = 0
+                self._last_reacquire_obstacle_retry_time = now
+                self._last_reacquire_obstacle_retry_allowed = True
+                self._reset_reacquire_obstacle_confirmation('retry_started')
+                self._last_reacquire_obstacle_confirmed = True
+                self._last_reacquire_obstacle_reason = 'reacquire_confirmed_obstacle_retry'
+                return 'OBSTACLE_CONFIRM', 0.0, 0.0, 'reacquire_confirmed_obstacle_retry'
+
+            self._last_reacquire_obstacle_retry_allowed = False
+            self._last_visual_avoid_reason = obstacle_reason
+            
+            reacquire_timeout = float(self.get_parameter('target_behind_reacquire_timeout_sec').value)
+            if phase_elapsed >= reacquire_timeout:
+                self._clear_target_behind_obstacle_maneuver()
+                return None, 0.0, 0.0, 'target_behind_obstacle_give_up'
+            
+            reacquire_omega = float(self.get_parameter('target_behind_reacquire_omega').value)
+            omega = -self._last_target_behind_turn_direction * reacquire_omega
+            if obstacle_reason not in ('no_visual_obstacle', ''):
+                return 'POST_AVOID_REACQUIRE', 0.0, omega, obstacle_reason
+            return 'POST_AVOID_REACQUIRE', 0.0, omega, 'target_behind_reacquire'
+
+        return None, 0.0, 0.0, ''
+
+    def _clear_target_behind_obstacle_maneuver(self) -> None:
+        """Clear target behind obstacle maneuver state."""
+        self._target_behind_obstacle_active = False
+        self._target_behind_obstacle_confirmed = False
+        self._target_behind_obstacle_phase = 'none'
+        self._target_behind_obstacle_phase_start_time = 0.0
+        self._target_behind_obstacle_confirm_frames = 0
+        self._last_target_behind_obstacle_end_time = time.time()
+        self._reset_reacquire_obstacle_confirmation('maneuver_cleared')
 
     def _publish_stop(self, state: str, reason: str) -> None:
         self._last_v = 0.0
@@ -1083,6 +1634,35 @@ class MPCNode(Node):
             'post_avoid_search_active': diag['post_avoid_search_active'],
             'post_avoid_search_direction': diag['post_avoid_search_direction'],
             'search_direction_used': diag['search_direction_used'],
+            'target_behind_obstacle_suspected': diag['target_behind_obstacle_suspected'],
+            'target_behind_obstacle_confirmed': diag['target_behind_obstacle_confirmed'],
+            'target_behind_obstacle_active': diag['target_behind_obstacle_active'],
+            'target_behind_obstacle_phase': diag['target_behind_obstacle_phase'],
+            'target_behind_obstacle_phase_elapsed_sec': diag['target_behind_obstacle_phase_elapsed_sec'],
+            'target_behind_obstacle_retry_count': diag['target_behind_obstacle_retry_count'],
+            'target_behind_obstacle_reason': diag['target_behind_obstacle_reason'],
+            'last_target_behind_turn_direction': diag['last_target_behind_turn_direction'],
+            'last_target_ex_before_obstacle': diag['last_target_ex_before_obstacle'],
+            'last_obstacle_ex_before_avoid': diag['last_obstacle_ex_before_avoid'],
+            'post_avoid_reacquire_direction': diag['post_avoid_reacquire_direction'],
+            'maneuver_v_controller': diag['maneuver_v_controller'],
+            'maneuver_omega_controller': diag['maneuver_omega_controller'],
+            'visual_obstacle_requires_avoidance': diag['visual_obstacle_requires_avoidance'],
+            'visual_obstacle_avoidance_reason': diag['visual_obstacle_avoidance_reason'],
+            'visual_obstacle_ignored_in_search': diag['visual_obstacle_ignored_in_search'],
+            'visual_obstacle_ignore_reason': diag['visual_obstacle_ignore_reason'],
+            'visual_obstacle_blocks_target': diag['visual_obstacle_blocks_target'],
+            'visual_obstacle_target_ex_diff': diag['visual_obstacle_target_ex_diff'],
+            'reacquire_obstacle_confirmed': diag['reacquire_obstacle_confirmed'],
+            'reacquire_obstacle_confirm_frames': diag['reacquire_obstacle_confirm_frames'],
+            'reacquire_obstacle_seen_duration_sec': diag['reacquire_obstacle_seen_duration_sec'],
+            'reacquire_obstacle_reason': diag['reacquire_obstacle_reason'],
+            'reacquire_obstacle_ex': diag['reacquire_obstacle_ex'],
+            'reacquire_obstacle_area': diag['reacquire_obstacle_area'],
+            'visual_obstacle_edge_ignored': diag['visual_obstacle_edge_ignored'],
+            'visual_obstacle_in_path': diag['visual_obstacle_in_path'],
+            'reacquire_obstacle_retry_allowed': diag['reacquire_obstacle_retry_allowed'],
+            'last_reacquire_obstacle_retry_age_sec': diag['last_reacquire_obstacle_retry_age_sec'],
         }
         self._pub_diag.publish(String(data=json.dumps(debug_msg)))
 
@@ -1239,6 +1819,98 @@ class MPCNode(Node):
             'expected_turn_direction': self._get_expected_turn_direction(ex),
             'actual_turn_direction': self._get_actual_turn_direction(self._last_omega_cmd),
             'steering_sign_ok': self._check_steering_sign_ok(ex, self._last_omega_cmd),
+            'target_behind_obstacle_suspected': False,  # Will be set by caller if needed
+            'target_behind_obstacle_confirmed': bool(self._target_behind_obstacle_confirmed),
+            'target_behind_obstacle_active': bool(self._target_behind_obstacle_active),
+            'target_behind_obstacle_phase': self._target_behind_obstacle_phase,
+            'target_behind_obstacle_phase_elapsed_sec': (
+                None if self._target_behind_obstacle_phase_start_time <= 0.0
+                else round(now - self._target_behind_obstacle_phase_start_time, 4)
+            ),
+            'target_behind_obstacle_retry_count': self._target_behind_obstacle_retry_count,
+            'target_behind_obstacle_reason': '',  # Will be set by caller if needed
+            'last_target_behind_turn_direction': round(float(self._last_target_behind_turn_direction), 5),
+            'last_target_ex_before_obstacle': (
+                None if self._last_target_ex_before_obstacle is None
+                else round(float(self._last_target_ex_before_obstacle), 5)
+            ),
+            'last_obstacle_ex_before_avoid': (
+                None if self._last_obstacle_ex_before_avoid is None
+                else round(float(self._last_obstacle_ex_before_avoid), 5)
+            ),
+            'post_avoid_reacquire_direction': (
+                -self._last_target_behind_turn_direction
+                if self._target_behind_obstacle_phase == 'reacquire'
+                else 0.0
+            ),
+            'maneuver_v_controller': round(float(v_controller), 5),
+            'maneuver_omega_controller': round(float(omega_controller), 5),
+            'visual_obstacle_requires_avoidance': self._last_visual_avoid_reason not in [
+                'no_visual_obstacle', 'search_ignore_visual_obstacle_no_target',
+                'search_ignore_visual_obstacle_no_target_context',
+                'search_visual_obstacle_not_aligned_with_target',
+                'visual_obstacle_not_blocking_visible_target',
+                'visual_obstacle_not_aligned_with_recent_target',
+                'visual_obstacle_not_blocking_target',
+                'obstacle_not_close',
+                'obstacle_on_edge_ignored',
+                'obstacle_not_in_path',
+                'obstacle_area_too_small',
+                'reacquire_ignore_unconfirmed_obstacle',
+                'reacquire_waiting_for_obstacle_confirmation',
+            ],
+            'visual_obstacle_avoidance_reason': self._last_visual_avoid_reason,
+            'visual_obstacle_ignored_in_search': (
+                state == 'SEARCH' and self._last_visual_avoid_reason in [
+                    'search_ignore_visual_obstacle_no_target',
+                    'search_ignore_visual_obstacle_no_target_context',
+                    'search_visual_obstacle_not_aligned_with_target',
+                    'obstacle_on_edge_ignored',
+                ]
+            ),
+            'visual_obstacle_ignore_reason': (
+                self._last_visual_obstacle_ignore_reason
+                if self._last_visual_obstacle_ignore_reason else
+                self._last_visual_avoid_reason
+                if (state == 'SEARCH' or state == 'POST_AVOID_REACQUIRE')
+                and (
+                    'ignore' in self._last_visual_avoid_reason
+                    or self._last_visual_avoid_reason in [
+                        'obstacle_not_close',
+                        'obstacle_on_edge_ignored',
+                        'obstacle_not_in_path',
+                        'obstacle_area_too_small',
+                    ]
+                )
+                else ''
+            ),
+            'visual_obstacle_blocks_target': self._last_visual_avoid_reason in [
+                'visual_obstacle_blocks_visible_target',
+                'visual_obstacle_blocks_recent_target',
+                'search_visual_obstacle_blocks_recent_target',
+                'target_behind_obstacle_maneuver_active',
+                'reacquire_obstacle_confirmed',
+            ],
+            'visual_obstacle_target_ex_diff': (
+                None if not visual_status.get('detected', False) or ex is None
+                else round(abs(float(ex) - float(visual_status.get('ex', 0.0))), 5)
+            ),
+            'reacquire_obstacle_confirmed': bool(self._last_reacquire_obstacle_confirmed),
+            'reacquire_obstacle_confirm_frames': int(self._reacquire_obstacle_confirm_frames),
+            'reacquire_obstacle_seen_duration_sec': (
+                None if self._reacquire_obstacle_first_seen_time <= 0.0
+                else round(now - self._reacquire_obstacle_first_seen_time, 4)
+            ),
+            'reacquire_obstacle_reason': self._last_reacquire_obstacle_reason,
+            'reacquire_obstacle_ex': round(float(self._reacquire_obstacle_candidate_ex), 5),
+            'reacquire_obstacle_area': round(float(self._reacquire_obstacle_candidate_area), 2),
+            'visual_obstacle_edge_ignored': bool(self._last_visual_obstacle_edge_ignored),
+            'visual_obstacle_in_path': bool(self._last_visual_obstacle_in_path),
+            'reacquire_obstacle_retry_allowed': bool(self._last_reacquire_obstacle_retry_allowed),
+            'last_reacquire_obstacle_retry_age_sec': (
+                None if self._last_reacquire_obstacle_retry_time <= 0.0
+                else round(now - self._last_reacquire_obstacle_retry_time, 4)
+            ),
         }
 
     def _get_expected_turn_direction(self, ex: float) -> str:
@@ -1324,6 +1996,20 @@ class MPCNode(Node):
             'emergency_stop_active', 'hard_v_limit', 'hard_omega_limit',
             'command_is_finite', 'expected_turn_direction', 'actual_turn_direction',
             'steering_sign_ok',
+            'target_behind_obstacle_suspected', 'target_behind_obstacle_confirmed',
+            'target_behind_obstacle_active', 'target_behind_obstacle_phase',
+            'target_behind_obstacle_phase_elapsed_sec', 'target_behind_obstacle_retry_count',
+            'target_behind_obstacle_reason', 'last_target_behind_turn_direction',
+            'last_target_ex_before_obstacle', 'last_obstacle_ex_before_avoid',
+            'post_avoid_reacquire_direction', 'maneuver_v_controller', 'maneuver_omega_controller',
+            'visual_obstacle_requires_avoidance', 'visual_obstacle_avoidance_reason',
+            'visual_obstacle_ignored_in_search', 'visual_obstacle_ignore_reason',
+            'visual_obstacle_blocks_target', 'visual_obstacle_target_ex_diff',
+            'reacquire_obstacle_confirmed', 'reacquire_obstacle_confirm_frames',
+            'reacquire_obstacle_seen_duration_sec', 'reacquire_obstacle_reason',
+            'reacquire_obstacle_ex', 'reacquire_obstacle_area',
+            'visual_obstacle_edge_ignored', 'visual_obstacle_in_path',
+            'reacquire_obstacle_retry_allowed', 'last_reacquire_obstacle_retry_age_sec',
         ]
 
     def _write_csv_row(self, row: Dict[str, Any]) -> None:

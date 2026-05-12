@@ -98,6 +98,9 @@ class VisionNode(Node):
         self.declare_parameter('red_box_bottom_roi_y_min_ratio', 0.45)
         self.declare_parameter('red_box_exclude_target_iou_threshold', 0.10)
         self.declare_parameter('red_box_exclude_circular_targets', True)
+        self.declare_parameter('show_fsm_state_overlay', True)
+        self.declare_parameter('fsm_state_topic', '/fsm_state')
+        self.declare_parameter('fsm_state_stale_sec', 1.0)
         self.declare_parameter('red_box_min_red_dominance', 1.25)
         self.declare_parameter('red_box_min_mean_saturation', 90)
         self.declare_parameter('red_box_allow_vertical_edge_partial', False)
@@ -143,6 +146,8 @@ class VisionNode(Node):
         self._visual_obstacle_tracking_active = False
         self._last_visual_obstacle_close_time = 0.0
         self._visual_obstacle_track_counter = 0
+        self._latest_fsm_state = "UNKNOWN"
+        self._last_fsm_state_time = 0.0
 
         # ── Camera ──────────────────────────────────────────────────────────────
         if self.get_parameter('use_gstreamer').value:
@@ -180,6 +185,12 @@ class VisionNode(Node):
         self._pub = self.create_publisher(VisionState, '/vision_state', 10)
         self._pub_obstacle = self.create_publisher(
             String, '/vision_obstacle_debug', 10
+        )
+
+        # ── Subscriber for FSM state overlay ────────────────────────────────────
+        fsm_topic = str(self.get_parameter('fsm_state_topic').value)
+        self._sub_fsm = self.create_subscription(
+            String, fsm_topic, self._fsm_state_callback, 10
         )
 
         self.create_timer(1.0 / fps, self._process_frame)
@@ -424,6 +435,11 @@ class VisionNode(Node):
         msg.area         = area
         msg.object_detected = detected
         self._pub.publish(msg)
+
+    def _fsm_state_callback(self, msg: String) -> None:
+        """Callback to receive FSM state from control node."""
+        self._latest_fsm_state = msg.data
+        self._last_fsm_state_time = time.time()
 
     def _detect_visual_obstacles(
         self, frame: 'np.ndarray', hsv: 'np.ndarray', target_metrics=None
@@ -1110,6 +1126,55 @@ class VisionNode(Node):
                 color,
                 2,
             )
+        
+        # Draw FSM state overlay
+        if bool(self.get_parameter('show_fsm_state_overlay').value):
+            now = time.time()
+            stale_sec = float(self.get_parameter('fsm_state_stale_sec').value)
+            age = now - self._last_fsm_state_time if self._last_fsm_state_time > 0.0 else 999.0
+            
+            if age > stale_sec:
+                fsm_text = "FSM: STALE/UNKNOWN"
+                fsm_color = (128, 128, 128)  # Gray
+            else:
+                fsm_text = f"FSM: {self._latest_fsm_state}"
+                # Color based on state
+                state = self._latest_fsm_state
+                if state == "EMERGENCY_STOP":
+                    fsm_color = (0, 0, 255)  # Red
+                elif state == "WAIT_FOR_CAMERA":
+                    fsm_color = (0, 255, 255)  # Yellow
+                elif state in ["TRACKING", "ACQUIRE_TARGET", "GOAL_REACHED"]:
+                    fsm_color = (0, 255, 0)  # Green
+                elif state in ["AVOID", "OBSTACLE_CONFIRM", "AVOID_TURN", "AVOID_FORWARD", 
+                               "POST_AVOID_TURN_BACK", "POST_AVOID_REACQUIRE"]:
+                    fsm_color = (255, 165, 0)  # Orange
+                elif state == "SEARCH":
+                    fsm_color = (255, 255, 255)  # White
+                else:
+                    fsm_color = (200, 200, 200)  # Light gray
+            
+            # Draw background rectangle
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            thickness = 2
+            (text_w, text_h), baseline = cv2.getTextSize(fsm_text, font, font_scale, thickness)
+            padding = 10
+            rect_x1 = 10
+            rect_y1 = preview.shape[0] - text_h - baseline - 2 * padding
+            rect_x2 = rect_x1 + text_w + 2 * padding
+            rect_y2 = preview.shape[0] - padding
+            
+            # Semi-transparent black background
+            overlay = preview.copy()
+            cv2.rectangle(overlay, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, preview, 0.4, 0, preview)
+            
+            # Draw text
+            text_x = rect_x1 + padding
+            text_y = rect_y2 - padding - baseline
+            cv2.putText(preview, fsm_text, (text_x, text_y), font, font_scale, fsm_color, thickness)
+        
         try:
             cv2.imshow('Robot View', preview)
             cv2.waitKey(1)

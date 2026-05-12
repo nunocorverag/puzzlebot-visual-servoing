@@ -73,3 +73,6 @@ visual_obstacle_area_shrink_max_ratio: 0.15
 visual_obstacle_allow_partial_frame: true
 visual_obstacle_partial_margin_px: 20
 visual_obstacle_close_latch_sec: 0.75
+show_fsm_state_overlay: true
+fsm_state_topic: "/fsm_state"
+fsm_state_stale_sec: 1.0
