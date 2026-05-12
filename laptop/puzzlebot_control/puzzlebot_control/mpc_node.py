@@ -172,6 +172,24 @@ class MPCNode(Node):
         self.declare_parameter('avoid_direction', 1.0)
         self.declare_parameter('avoid_forward_speed', 0.02)
         self.declare_parameter('avoid_reverse_speed', 0.0)
+        self.declare_parameter('enable_visual_obstacle_avoidance', True)
+        self.declare_parameter('visual_obstacle_close_required', True)
+        self.declare_parameter('visual_obstacle_timeout_sec', 0.5)
+        self.declare_parameter('visual_obstacle_clear_grace_sec', 0.30)
+        self.declare_parameter('visual_obstacle_min_area', 2500.0)
+        self.declare_parameter('visual_obstacle_center_deadband', 0.10)
+        self.declare_parameter('visual_avoid_omega', 0.14)
+        self.declare_parameter('visual_avoid_forward_speed', 0.0)
+        self.declare_parameter('visual_avoid_default_direction', 1.0)
+        self.declare_parameter('use_post_avoid_search_direction', True)
+        self.declare_parameter('post_avoid_search_memory_sec', 2.0)
+        self.declare_parameter('require_camera_ready', True)
+        self.declare_parameter('camera_ready_timeout_sec', 1.0)
+        self.declare_parameter('camera_startup_grace_sec', 0.5)
+        self.declare_parameter('camera_lost_stop', True)
+        self.declare_parameter('camera_ready_min_messages', 3)
+        self.declare_parameter('camera_ready_require_fresh_obstacle_debug', False)
+        self.declare_parameter('camera_ready_obstacle_timeout_sec', 1.0)
         self.declare_parameter('publish_debug', True)
         self.declare_parameter('debug_log_period_sec', 1.0)
         self.declare_parameter('enable_csv_log', True)
@@ -198,6 +216,17 @@ class MPCNode(Node):
         self._last_seen: float = 0.0
         self._last_target_ex: Optional[float] = None
         self._last_target_seen_time: float = 0.0
+        self._last_vision_state_time: float = 0.0
+        self._vision_state_count: int = 0
+        self._camera_ready: bool = False
+        self._camera_was_ready: bool = False
+        self._last_camera_ready_warn_time: float = 0.0
+        self._last_camera_status: Dict[str, Any] = {
+            'ready': False,
+            'reason': 'no_vision_state_received',
+            'vision_age_sec': None,
+            'waiting_for_camera': True,
+        }
         self._last_v: float = 0.0
         self._last_omega: float = 0.0
         self._last_v_controller: float = 0.0
@@ -214,6 +243,16 @@ class MPCNode(Node):
         self._last_obstacle_time: float = 0.0
         self._latest_vision_obstacle: Dict[str, Any] = {}
         self._last_vision_obstacle_time: float = 0.0
+        self._last_visual_obstacle_active_time: float = 0.0
+        self._last_visual_obstacle_warn_time: float = 0.0
+        self._last_visual_obstacle_status: Dict[str, Any] = {}
+        self._last_avoid_source: str = 'none'
+        self._last_avoid_turn_direction: float = 0.0
+        self._last_avoid_end_time: float = 0.0
+        self._last_visual_avoid_turn_direction: float = 0.0
+        self._last_search_direction_used: float = 0.0
+        self._post_avoid_search_active: bool = False
+        self._post_avoid_search_direction: float = 0.0
         self._last_log_time: float = 0.0
         self._last_obstacle_missing_log_time: float = 0.0
         self._start_time: float = time.time()
@@ -292,8 +331,10 @@ class MPCNode(Node):
 
     def _vision_cb(self, msg: VisionState) -> None:
         self._latest_vs = msg
+        now = time.time()
+        self._last_vision_state_time = now
+        self._vision_state_count += 1
         if msg.object_detected:
-            now = time.time()
             self._last_seen = now
             self._last_target_seen_time = now
             self._last_target_ex = float(msg.ex)
@@ -329,8 +370,20 @@ class MPCNode(Node):
         area = float(vs.area) if detected and vs is not None else 0.0
         ex = float(vs.ex) if detected and vs is not None else 0.0
         last_target_age = self._target_age(now)
+        camera_ready, camera_reason, vision_age = self._camera_ready_status(now)
+        self._last_camera_status = {
+            'ready': camera_ready,
+            'reason': camera_reason,
+            'vision_age_sec': vision_age,
+            'waiting_for_camera': not camera_ready,
+        }
         obstacle_available, d_obs, obstacle_raw, obstacle_age = self._obstacle_status(now)
-        obstacle_active = self._obstacle_active(obstacle_available, d_obs)
+        laser_obstacle_active = self._obstacle_active(obstacle_available, d_obs)
+        visual_status = self._visual_obstacle_status(now)
+        avoid_active, avoid_source, avoid_turn_direction, avoid_v, avoid_omega = (
+            self._avoid_status(laser_obstacle_active, d_obs, visual_status)
+        )
+        obstacle_active = avoid_active
         cost = None
         solve_ms = None
 
@@ -356,14 +409,40 @@ class MPCNode(Node):
             )
             return
 
-        if obstacle_active:
-            state = 'AVOID'
-            reason = (
-                'obstacle_enter_stop_zone'
-                if d_obs is not None and d_obs < float(self.get_parameter('obstacle_stop_distance').value)
-                else 'obstacle_enter_avoid_zone'
+        if not camera_ready:
+            state = 'WAIT_FOR_CAMERA'
+            v, omega = 0.0, 0.0
+            self._camera_ready = False
+            self._publish_stop(state, camera_reason)
+            self._log_camera_not_ready(now, camera_reason)
+            self._publish_debug(
+                state, ex, area, detected, last_target_age,
+                obstacle_available, obstacle_active, d_obs, obstacle_raw, obstacle_age,
+                v, omega, stop_commanded=True, stop_reason='camera_not_ready',
+                notes=camera_reason
             )
-            v, omega = self._avoid_command(d_obs)
+            return
+
+        self._camera_ready = True
+        self._camera_was_ready = True
+
+        if avoid_active:
+            state = 'AVOID'
+            if avoid_source == 'both':
+                reason = 'both_obstacles_enter_avoid'
+            elif avoid_source == 'vision':
+                reason = 'visual_obstacle_enter_avoid'
+            else:
+                reason = (
+                    'obstacle_enter_stop_zone'
+                    if d_obs is not None and d_obs < float(self.get_parameter('obstacle_stop_distance').value)
+                    else 'laser_obstacle_enter_avoid'
+                )
+            v, omega = avoid_v, avoid_omega
+            self._last_avoid_source = avoid_source
+            self._last_visual_avoid_turn_direction = (
+                avoid_turn_direction if avoid_source in ('vision', 'both') else 0.0
+            )
             self._publish_cmd(v, omega, state, smooth=False, transition_reason=reason)
             self._publish_debug(
                 state, ex, area, detected, last_target_age,
@@ -411,7 +490,7 @@ class MPCNode(Node):
             self._acquire_started = now
             v, omega = 0.0, 0.0
             reason = (
-                'obstacle_clear_target_visible'
+                self._avoid_clear_reason(target_visible=True)
                 if self._state == 'AVOID'
                 else 'search_target_detected_acquire'
             )
@@ -500,7 +579,9 @@ class MPCNode(Node):
         if self._state == 'ACQUIRE_TARGET':
             reason = 'acquire_target_lost_timeout_search'
         elif self._state == 'AVOID':
-            reason = 'obstacle_clear_no_target_search'
+            reason = self._avoid_clear_reason(target_visible=False)
+        if state == 'SEARCH' and self._post_avoid_search_active:
+            reason = 'post_avoid_search_opposite_direction'
         elif self._state == 'IDLE' and state == 'IDLE':
             reason = 'idle_no_search'
         self._publish_cmd(v, omega, state, smooth=False, transition_reason=reason)
@@ -521,6 +602,45 @@ class MPCNode(Node):
         if self._last_target_seen_time <= 0.0:
             return None
         return now - self._last_target_seen_time
+
+    def _camera_ready_status(self, now: float) -> Tuple[bool, str, Optional[float]]:
+        if not bool(self.get_parameter('require_camera_ready').value):
+            return True, 'camera_not_required', None
+
+        if self._last_vision_state_time <= 0.0:
+            return False, 'no_vision_state_received', None
+
+        vision_age = now - self._last_vision_state_time
+        min_messages = max(int(self.get_parameter('camera_ready_min_messages').value), 1)
+        if self._vision_state_count < min_messages:
+            return False, 'not_enough_vision_messages', vision_age
+
+        if vision_age > float(self.get_parameter('camera_ready_timeout_sec').value):
+            return False, 'vision_state_stale', vision_age
+
+        if bool(self.get_parameter('camera_ready_require_fresh_obstacle_debug').value):
+            if self._last_vision_obstacle_time <= 0.0:
+                return False, 'no_vision_obstacle_debug_received', vision_age
+            obstacle_age = now - self._last_vision_obstacle_time
+            if obstacle_age > float(self.get_parameter('camera_ready_obstacle_timeout_sec').value):
+                return False, 'vision_obstacle_debug_stale', vision_age
+
+        return True, 'camera_ready', vision_age
+
+    def _log_camera_not_ready(self, now: float, reason: str) -> None:
+        startup_grace = float(self.get_parameter('camera_startup_grace_sec').value)
+        if (now - self._start_time) < startup_grace:
+            return
+        if (now - self._last_camera_ready_warn_time) < self._debug_period:
+            return
+        if self._camera_was_ready and bool(self.get_parameter('camera_lost_stop').value):
+            self.get_logger().warn(
+                f'Camera lost/stale; stopping robot until vision_state is fresh again. '
+                f'reason={reason}'
+            )
+        else:
+            self.get_logger().warn(f'Waiting for camera before moving. reason={reason}')
+        self._last_camera_ready_warn_time = now
 
     def _obstacle_status(
         self, now: float
@@ -554,6 +674,116 @@ class MPCNode(Node):
         threshold = clear_distance if self._state == 'AVOID' else avoid_distance
         return distance < threshold
 
+    def _visual_obstacle_status(self, now: float) -> Dict[str, Any]:
+        age = None if self._last_vision_obstacle_time <= 0.0 else now - self._last_vision_obstacle_time
+        data = self._latest_vision_obstacle
+        status = {
+            'detected': bool(data.get('blue_obstacle_detected', False)),
+            'close': bool(data.get('blue_obstacle_close', False)),
+            'area': 0.0,
+            'ex': 0.0,
+            'age_sec': age,
+            'raw_active': False,
+            'active': False,
+            'turn_direction': 0.0,
+        }
+
+        if not bool(self.get_parameter('enable_visual_obstacle_avoidance').value):
+            self._last_visual_obstacle_status = status
+            return status
+
+        if age is None or age > float(self.get_parameter('visual_obstacle_timeout_sec').value):
+            self._last_visual_obstacle_status = status
+            return status
+
+        try:
+            area = float(data.get('blue_obstacle_area', 0.0))
+            ex = float(data.get('blue_obstacle_ex', 0.0))
+        except (TypeError, ValueError):
+            self._warn_bad_visual_obstacle(now, 'non_numeric_visual_obstacle')
+            self._last_visual_obstacle_status = status
+            return status
+
+        if not (np.isfinite(area) and np.isfinite(ex)):
+            self._warn_bad_visual_obstacle(now, 'non_finite_visual_obstacle')
+            self._last_visual_obstacle_status = status
+            return status
+
+        status['area'] = area
+        status['ex'] = ex
+        close_ok = bool(status['close']) or not bool(
+            self.get_parameter('visual_obstacle_close_required').value
+        )
+        area_ok = area >= float(self.get_parameter('visual_obstacle_min_area').value)
+        raw_active = bool(status['detected']) and close_ok and area_ok
+        if raw_active:
+            self._last_visual_obstacle_active_time = now
+
+        clear_grace = float(self.get_parameter('visual_obstacle_clear_grace_sec').value)
+        grace_active = (
+            self._state == 'AVOID'
+            and self._last_visual_obstacle_active_time > 0.0
+            and (now - self._last_visual_obstacle_active_time) <= clear_grace
+        )
+        active = raw_active or grace_active
+        status['raw_active'] = raw_active
+        status['active'] = active
+        if raw_active:
+            status['turn_direction'] = self._visual_avoid_turn_direction(ex)
+        elif grace_active and self._last_visual_avoid_turn_direction != 0.0:
+            status['turn_direction'] = self._last_visual_avoid_turn_direction
+        else:
+            status['turn_direction'] = self._visual_avoid_turn_direction(ex)
+        self._last_visual_obstacle_status = status
+        return status
+
+    def _warn_bad_visual_obstacle(self, now: float, reason: str) -> None:
+        if (now - self._last_visual_obstacle_warn_time) < self._debug_period:
+            return
+        self.get_logger().warn(f'Ignoring malformed visual obstacle debug: {reason}')
+        self._last_visual_obstacle_warn_time = now
+
+    def _visual_avoid_turn_direction(self, obstacle_ex: float) -> float:
+        deadband = float(self.get_parameter('visual_obstacle_center_deadband').value)
+        if obstacle_ex > deadband:
+            return 1.0   # obstacle right -> turn left
+        if obstacle_ex < -deadband:
+            return -1.0  # obstacle left -> turn right
+        default_direction = float(self.get_parameter('visual_avoid_default_direction').value)
+        return 1.0 if default_direction >= 0.0 else -1.0
+
+    def _avoid_status(
+        self,
+        laser_active: bool,
+        distance: Optional[float],
+        visual_status: Dict[str, Any],
+    ) -> Tuple[bool, str, float, float, float]:
+        visual_active = bool(visual_status.get('active', False))
+        if laser_active and visual_active:
+            source = 'both'
+        elif laser_active:
+            source = 'laser'
+        elif visual_active:
+            source = 'vision'
+        else:
+            return False, 'none', 0.0, 0.0, 0.0
+
+        laser_v, laser_omega = self._avoid_command(distance)
+        visual_direction = float(visual_status.get('turn_direction', 0.0))
+        visual_v = float(self.get_parameter('visual_avoid_forward_speed').value)
+        visual_omega = visual_direction * float(self.get_parameter('visual_avoid_omega').value)
+
+        if source == 'laser':
+            turn_direction = 1.0 if laser_omega >= 0.0 else -1.0
+            return True, source, turn_direction, laser_v, laser_omega
+
+        if source == 'vision':
+            return True, source, visual_direction, visual_v, visual_omega
+
+        turn_direction = visual_direction
+        v = min(laser_v, visual_v)
+        return True, source, turn_direction, v, visual_omega
+
     def _avoid_command(self, distance: Optional[float]) -> Tuple[float, float]:
         stop_distance = float(self.get_parameter('obstacle_stop_distance').value)
         v = float(self.get_parameter('avoid_forward_speed').value)
@@ -567,9 +797,33 @@ class MPCNode(Node):
 
     def _search_command(self) -> Tuple[str, float, float]:
         if not bool(self.get_parameter('enable_search').value):
+            self._last_search_direction_used = 0.0
+            self._post_avoid_search_active = False
+            self._post_avoid_search_direction = 0.0
             return 'IDLE', 0.0, 0.0
         direction = float(self.get_parameter('search_direction').value)
+        self._post_avoid_search_active = False
+        self._post_avoid_search_direction = 0.0
+        now = time.time()
+        within_post_avoid_window = (
+            self._state == 'AVOID'
+            or (
+                self._last_avoid_end_time > 0.0
+                and (now - self._last_avoid_end_time)
+                <= float(self.get_parameter('post_avoid_search_memory_sec').value)
+            )
+        )
         if (
+            bool(self.get_parameter('use_post_avoid_search_direction').value)
+            and self._last_avoid_turn_direction != 0.0
+            and within_post_avoid_window
+        ):
+            direction = -float(np.sign(self._last_avoid_turn_direction))
+            self._post_avoid_search_active = True
+            self._post_avoid_search_direction = direction
+        if (
+            not self._post_avoid_search_active
+            and
             bool(self.get_parameter('use_last_target_search_direction').value)
             and self._last_target_ex is not None
             and abs(self._last_target_ex) > 1.0e-3
@@ -579,7 +833,21 @@ class MPCNode(Node):
         omega = (
             direction * float(self.get_parameter('search_omega').value)
         )
+        self._last_search_direction_used = direction
         return 'SEARCH', 0.0, omega
+
+    def _avoid_clear_reason(self, target_visible: bool) -> str:
+        if self._last_avoid_source == 'vision':
+            return (
+                'visual_obstacle_clear_target_visible'
+                if target_visible else 'visual_obstacle_clear_no_target_search'
+            )
+        if self._last_avoid_source == 'both':
+            return (
+                'both_obstacles_clear_target_visible'
+                if target_visible else 'both_obstacles_clear_no_target_search'
+            )
+        return 'obstacle_clear_target_visible' if target_visible else 'obstacle_clear_no_target_search'
 
     def _publish_stop(self, state: str, reason: str) -> None:
         self._last_v = 0.0
@@ -682,6 +950,10 @@ class MPCNode(Node):
         self._pub_cmd.publish(cmd)
 
         previous_state = self._state
+        if state == 'AVOID' and abs(omega_controller) > 1.0e-6:
+            self._last_avoid_turn_direction = float(np.sign(omega_controller))
+        if previous_state == 'AVOID' and state != 'AVOID':
+            self._last_avoid_end_time = time.time()
         self._last_v = v
         self._last_omega = omega_controller
         self._last_v_controller = v
@@ -766,6 +1038,13 @@ class MPCNode(Node):
             'area': diag['area'],
             'object_detected': diag['object_detected'],
             'last_target_age_sec': diag['last_target_age_sec'],
+            'camera_ready': diag['camera_ready'],
+            'camera_status_reason': diag['camera_status_reason'],
+            'vision_state_age_sec': diag['vision_state_age_sec'],
+            'vision_state_count': diag['vision_state_count'],
+            'require_camera_ready': diag['require_camera_ready'],
+            'camera_lost_stop': diag['camera_lost_stop'],
+            'waiting_for_camera': diag['waiting_for_camera'],
             'obstacle_available': diag['obstacle_available'],
             'obstacle_active': diag['obstacle_active'],
             'd_obs': diag['d_obs'],
@@ -791,6 +1070,19 @@ class MPCNode(Node):
             'vision_blue_obstacle_ex': diag['vision_blue_obstacle_ex'],
             'vision_blue_obstacle_count': diag['vision_blue_obstacle_count'],
             'vision_obstacle_age_sec': diag['vision_obstacle_age_sec'],
+            'visual_obstacle_detected': diag['visual_obstacle_detected'],
+            'visual_obstacle_close': diag['visual_obstacle_close'],
+            'visual_obstacle_area': diag['visual_obstacle_area'],
+            'visual_obstacle_ex': diag['visual_obstacle_ex'],
+            'visual_obstacle_age_sec': diag['visual_obstacle_age_sec'],
+            'visual_obstacle_active': diag['visual_obstacle_active'],
+            'visual_obstacle_source_active': diag['visual_obstacle_source_active'],
+            'avoid_source': diag['avoid_source'],
+            'last_avoid_turn_direction': diag['last_avoid_turn_direction'],
+            'visual_avoid_turn_direction_controller': diag['visual_avoid_turn_direction_controller'],
+            'post_avoid_search_active': diag['post_avoid_search_active'],
+            'post_avoid_search_direction': diag['post_avoid_search_direction'],
+            'search_direction_used': diag['search_direction_used'],
         }
         self._pub_diag.publish(String(data=json.dumps(debug_msg)))
 
@@ -826,6 +1118,9 @@ class MPCNode(Node):
             if self._acquire_started > 0.0 and state == 'ACQUIRE_TARGET'
             else None
         )
+        visual_status = self._last_visual_obstacle_status
+        camera_status = self._last_camera_status
+        current_avoid_source = self._last_avoid_source if state == 'AVOID' else 'none'
         return {
             'timestamp_wall': datetime.now().isoformat(timespec='milliseconds'),
             'time_since_start_sec': round(now - self._start_time, 4),
@@ -842,6 +1137,16 @@ class MPCNode(Node):
             'last_target_age_sec': (
                 None if last_target_age is None else round(float(last_target_age), 4)
             ),
+            'camera_ready': bool(camera_status.get('ready', False)),
+            'camera_status_reason': str(camera_status.get('reason', 'unknown')),
+            'vision_state_age_sec': (
+                None if camera_status.get('vision_age_sec') is None
+                else round(float(camera_status.get('vision_age_sec')), 4)
+            ),
+            'vision_state_count': int(self._vision_state_count),
+            'require_camera_ready': bool(self.get_parameter('require_camera_ready').value),
+            'camera_lost_stop': bool(self.get_parameter('camera_lost_stop').value),
+            'waiting_for_camera': bool(camera_status.get('waiting_for_camera', False)),
             'acquire_active': state == 'ACQUIRE_TARGET',
             'acquire_elapsed_sec': (
                 None if acquire_elapsed is None else round(float(acquire_elapsed), 4)
@@ -903,6 +1208,28 @@ class MPCNode(Node):
                 None if self._last_vision_obstacle_time <= 0.0
                 else round(now - self._last_vision_obstacle_time, 4)
             ),
+            'visual_obstacle_detected': bool(visual_status.get('detected', False)),
+            'visual_obstacle_close': bool(visual_status.get('close', False)),
+            'visual_obstacle_area': round(float(visual_status.get('area', 0.0)), 2),
+            'visual_obstacle_ex': round(float(visual_status.get('ex', 0.0)), 5),
+            'visual_obstacle_age_sec': (
+                None if visual_status.get('age_sec') is None
+                else round(float(visual_status.get('age_sec')), 4)
+            ),
+            'visual_obstacle_active': bool(visual_status.get('active', False)),
+            'visual_obstacle_source_active': bool(visual_status.get('raw_active', False)),
+            'avoid_source': current_avoid_source,
+            'last_avoid_turn_direction': round(float(self._last_avoid_turn_direction), 5),
+            'visual_avoid_turn_direction_controller': round(
+                float(self._last_visual_avoid_turn_direction), 5
+            ),
+            'last_avoid_end_time_sec': (
+                None if self._last_avoid_end_time <= 0.0
+                else round(float(now - self._last_avoid_end_time), 4)
+            ),
+            'post_avoid_search_active': bool(self._post_avoid_search_active),
+            'post_avoid_search_direction': round(float(self._post_avoid_search_direction), 5),
+            'search_direction_used': round(float(self._last_search_direction_used), 5),
             'emergency_stop_active': bool(self._emergency_stop_active),
             'hard_v_limit': float(self.get_parameter('hard_v_limit').value),
             'hard_omega_limit': float(self.get_parameter('hard_omega_limit').value),
@@ -971,6 +1298,9 @@ class MPCNode(Node):
             'state', 'previous_state', 'transition_reason',
             'object_detected', 'ex', 'area', 'last_target_ex',
             'last_target_age_sec', 'acquire_active', 'acquire_elapsed_sec',
+            'camera_ready', 'camera_status_reason', 'vision_state_age_sec',
+            'vision_state_count', 'require_camera_ready', 'camera_lost_stop',
+            'waiting_for_camera',
             'acquire_hold_sec', 'acquire_timeout_sec', 'target_lost_grace_sec',
             'obstacle_raw', 'obstacle_distance_m', 'obstacle_available',
             'obstacle_age_sec', 'obstacle_active', 'obstacle_stop_distance',
@@ -984,6 +1314,13 @@ class MPCNode(Node):
             'vision_blue_obstacle_detected', 'vision_blue_obstacle_close',
             'vision_blue_obstacle_area', 'vision_blue_obstacle_ex',
             'vision_blue_obstacle_count', 'vision_obstacle_age_sec',
+            'visual_obstacle_detected', 'visual_obstacle_close',
+            'visual_obstacle_area', 'visual_obstacle_ex',
+            'visual_obstacle_age_sec', 'visual_obstacle_active',
+            'visual_obstacle_source_active', 'avoid_source',
+            'last_avoid_turn_direction', 'visual_avoid_turn_direction_controller',
+            'last_avoid_end_time_sec', 'post_avoid_search_active',
+            'post_avoid_search_direction', 'search_direction_used',
             'emergency_stop_active', 'hard_v_limit', 'hard_omega_limit',
             'command_is_finite', 'expected_turn_direction', 'actual_turn_direction',
             'steering_sign_ok',

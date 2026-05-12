@@ -57,15 +57,58 @@ class VisionNode(Node):
         self.declare_parameter('area_smoothing_alpha', 0.35)
         self.declare_parameter('ex_deadband', 0.05)
         self.declare_parameter('show_debug_view', True)
-        self.declare_parameter('enable_blue_obstacle_detection', True)
-        self.declare_parameter('blue_h_min', 90)
-        self.declare_parameter('blue_h_max', 135)
-        self.declare_parameter('blue_s_min', 40)
+        self.declare_parameter('enable_blue_obstacle_detection', False)
+        self.declare_parameter('blue_h_min', 102)
+        self.declare_parameter('blue_h_max', 110)
+        self.declare_parameter('blue_s_min', 130)
         self.declare_parameter('blue_s_max', 255)
-        self.declare_parameter('blue_v_min', 20)
-        self.declare_parameter('blue_v_max', 255)
+        self.declare_parameter('blue_v_min', 70)
+        self.declare_parameter('blue_v_max', 170)
         self.declare_parameter('blue_min_area', 800.0)
         self.declare_parameter('blue_close_area', 2500.0)
+        self.declare_parameter('enable_cream_obstacle_detection', False)
+        self.declare_parameter('cream_h_min', 15)
+        self.declare_parameter('cream_h_max', 40)
+        self.declare_parameter('cream_s_min', 10)
+        self.declare_parameter('cream_s_max', 90)
+        self.declare_parameter('cream_v_min', 120)
+        self.declare_parameter('cream_v_max', 255)
+        self.declare_parameter('cream_min_area', 1500.0)
+        self.declare_parameter('cream_close_area', 5000.0)
+        self.declare_parameter('cream_min_height_px', 120)
+        self.declare_parameter('cream_min_aspect_ratio', 1.6)
+        self.declare_parameter('cream_max_aspect_ratio', 6.0)
+        self.declare_parameter('enable_red_box_obstacle_detection', True)
+        self.declare_parameter('red_box_h1_min', 0)
+        self.declare_parameter('red_box_h1_max', 15)
+        self.declare_parameter('red_box_h2_min', 170)
+        self.declare_parameter('red_box_h2_max', 179)
+        self.declare_parameter('red_box_s_min', 100)
+        self.declare_parameter('red_box_s_max', 255)
+        self.declare_parameter('red_box_v_min', 60)
+        self.declare_parameter('red_box_v_max', 255)
+        self.declare_parameter('red_box_min_area', 1200.0)
+        self.declare_parameter('red_box_close_area', 4500.0)
+        self.declare_parameter('red_box_min_width_px', 70)
+        self.declare_parameter('red_box_min_height_px', 25)
+        self.declare_parameter('red_box_min_aspect_ratio', 1.25)
+        self.declare_parameter('red_box_max_aspect_ratio', 6.0)
+        self.declare_parameter('red_box_max_circularity', 0.60)
+        self.declare_parameter('red_box_min_fill_ratio', 0.35)
+        self.declare_parameter('red_box_bottom_roi_y_min_ratio', 0.45)
+        self.declare_parameter('red_box_exclude_target_iou_threshold', 0.10)
+        self.declare_parameter('red_box_exclude_circular_targets', True)
+        self.declare_parameter('red_box_min_red_dominance', 1.25)
+        self.declare_parameter('red_box_min_mean_saturation', 90)
+        self.declare_parameter('red_box_allow_vertical_edge_partial', False)
+        self.declare_parameter('visual_obstacle_memory_sec', 0.75)
+        self.declare_parameter('visual_obstacle_iou_match_threshold', 0.10)
+        self.declare_parameter('visual_obstacle_ex_match_threshold', 0.35)
+        self.declare_parameter('visual_obstacle_area_growth_max_ratio', 6.0)
+        self.declare_parameter('visual_obstacle_area_shrink_max_ratio', 0.15)
+        self.declare_parameter('visual_obstacle_allow_partial_frame', True)
+        self.declare_parameter('visual_obstacle_partial_margin_px', 20)
+        self.declare_parameter('visual_obstacle_close_latch_sec', 0.75)
         # Legacy red parameters are kept so old launch overrides do not fail.
         self.declare_parameter('hsv_lower1', [0,   100, 80])   # low-hue red
         self.declare_parameter('hsv_upper1', [10,  255, 255])
@@ -77,6 +120,8 @@ class VisionNode(Node):
         fps = self.get_parameter('camera_fps').value
 
         self._cx_image = W / 2.0   # image horizontal center (pixels)
+        self._frame_width = int(W)
+        self._frame_height = int(H)
         self._min_area = float(self.get_parameter('min_contour_area').value)
         self._show_debug = bool(self.get_parameter('show_debug_view').value)
         self._debug_failed = False
@@ -89,6 +134,15 @@ class VisionNode(Node):
         self._camera_available = False
         self._frame_fail_count = 0
         self._last_camera_error_log = 0.0
+        self._last_visual_obstacle_seen_time = 0.0
+        self._last_visual_obstacle_bbox = None
+        self._last_visual_obstacle_ex = 0.0
+        self._last_visual_obstacle_area = 0.0
+        self._last_visual_obstacle_aspect_ratio = 0.0
+        self._last_visual_obstacle_track_id = 0
+        self._visual_obstacle_tracking_active = False
+        self._last_visual_obstacle_close_time = 0.0
+        self._visual_obstacle_track_counter = 0
 
         # ── Camera ──────────────────────────────────────────────────────────────
         if self.get_parameter('use_gstreamer').value:
@@ -160,11 +214,11 @@ class VisionNode(Node):
         mask = self._segment(hsv)
         mask = self._clean(mask)
         ex, area, detected, contour, metrics = self._measure(mask)
-        blue_debug = self._detect_blue_obstacles(hsv)
-        self._publish_blue_obstacle_debug(blue_debug)
+        obstacle_debug = self._detect_visual_obstacles(frame, hsv, metrics)
+        self._publish_visual_obstacle_debug(obstacle_debug)
         ex, area, detected = self._apply_temporal_filter(ex, area, detected, metrics)
         self._publish(ex, area, detected)
-        self._show_preview(frame, ex, detected, contour, metrics, blue_debug)
+        self._show_preview(frame, ex, detected, contour, metrics, obstacle_debug)
 
     def _segment(self, hsv: 'np.ndarray') -> 'np.ndarray':
         """Single configurable HSV threshold for orange/terracotta targets."""
@@ -371,79 +425,607 @@ class VisionNode(Node):
         msg.object_detected = detected
         self._pub.publish(msg)
 
-    def _detect_blue_obstacles(self, hsv: 'np.ndarray') -> dict:
-        if not bool(self.get_parameter('enable_blue_obstacle_detection').value):
-            return self._empty_blue_debug()
+    def _detect_visual_obstacles(
+        self, frame: 'np.ndarray', hsv: 'np.ndarray', target_metrics=None
+    ) -> dict:
+        if not bool(self.get_parameter('enable_red_box_obstacle_detection').value):
+            return self._empty_visual_obstacle_debug('disabled')
 
-        lower = np.array([
-            int(self.get_parameter('blue_h_min').value),
-            int(self.get_parameter('blue_s_min').value),
-            int(self.get_parameter('blue_v_min').value),
-        ], dtype=np.uint8)
-        upper = np.array([
-            int(self.get_parameter('blue_h_max').value),
-            int(self.get_parameter('blue_s_max').value),
-            int(self.get_parameter('blue_v_max').value),
-        ], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        mask = self._clean(mask)
+        mask = self._red_box_mask(hsv)
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        min_area = float(self.get_parameter('blue_min_area').value)
-        close_area = float(self.get_parameter('blue_close_area').value)
+
         candidates = []
+        relaxed_candidates = []
+        rejected = []
         for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < min_area:
+            candidate = self._visual_obstacle_candidate(contour, frame, hsv, mask)
+            if candidate is None:
                 continue
-            x, y, w, h = cv2.boundingRect(contour)
-            M = cv2.moments(contour)
-            if M['m00'] == 0.0:
+            if self._is_target_overlap(candidate, target_metrics):
+                candidate['reject_reason'] = 'target_overlap'
+                rejected.append(candidate)
                 continue
-            cx = M['m10'] / M['m00']
-            cy = M['m01'] / M['m00']
-            ex = (cx - self._cx_image) / max(self._cx_image, 1.0)
-            candidates.append({
-                'area': area,
-                'bbox': [int(x), int(y), int(w), int(h)],
-                'centroid': [float(cx), float(cy)],
-                'ex': float(ex),
-            })
+            if self._passes_red_box_obstacle_filters(candidate):
+                candidates.append(candidate)
+            else:
+                candidate['reject_reason'] = self._red_box_reject_reason(candidate)
+                rejected.append(candidate)
+            if self._passes_relaxed_visual_obstacle_filters(candidate):
+                relaxed_candidates.append(candidate)
 
+        debug_stats = self._visual_obstacle_rejection_debug(
+            candidates, relaxed_candidates, rejected
+        )
+        return self._resolve_visual_obstacle_candidates(
+            candidates, relaxed_candidates, debug_stats
+        )
+
+    def _red_box_mask(self, hsv: 'np.ndarray') -> 'np.ndarray':
+        lower = np.array([
+            int(self.get_parameter('red_box_h1_min').value),
+            int(self.get_parameter('red_box_s_min').value),
+            int(self.get_parameter('red_box_v_min').value),
+        ], dtype=np.uint8)
+        upper = np.array([
+            int(self.get_parameter('red_box_h1_max').value),
+            int(self.get_parameter('red_box_s_max').value),
+            int(self.get_parameter('red_box_v_max').value),
+        ], dtype=np.uint8)
+        lower2 = np.array([
+            int(self.get_parameter('red_box_h2_min').value),
+            int(self.get_parameter('red_box_s_min').value),
+            int(self.get_parameter('red_box_v_min').value),
+        ], dtype=np.uint8)
+        upper2 = np.array([
+            int(self.get_parameter('red_box_h2_max').value),
+            int(self.get_parameter('red_box_s_max').value),
+            int(self.get_parameter('red_box_v_max').value),
+        ], dtype=np.uint8)
+        mask1 = cv2.inRange(hsv, lower, upper)
+        mask2 = cv2.inRange(hsv, lower2, upper2)
+        return self._clean(cv2.bitwise_or(mask1, mask2))
+
+    def _resolve_visual_obstacle_candidates(
+        self, candidates, relaxed_candidates, debug_stats: dict
+    ) -> dict:
+        now = time.time()
+        best = self._select_best_visual_obstacle(candidates)
+        if best is not None:
+            match_reason, iou, area_ratio = self._match_previous_visual_obstacle(best, now)
+            if match_reason == 'new_detection':
+                self._visual_obstacle_track_counter += 1
+                best['track_id'] = self._visual_obstacle_track_counter
+            else:
+                best['track_id'] = self._last_visual_obstacle_track_id
+            best['match_reason'] = match_reason
+            best['iou_with_last'] = iou
+            best['area_ratio'] = area_ratio
+            return self._update_visual_obstacle_memory(
+                best, now, match_reason, debug_stats=debug_stats
+            )
+
+        matched = self._select_memory_matched_visual_obstacle(relaxed_candidates, now)
+        if matched is not None:
+            candidate, match_reason, iou, area_ratio = matched
+            candidate['track_id'] = self._last_visual_obstacle_track_id
+            candidate['match_reason'] = match_reason
+            candidate['iou_with_last'] = iou
+            candidate['area_ratio'] = area_ratio
+            return self._update_visual_obstacle_memory(
+                candidate, now, match_reason, debug_stats=debug_stats
+            )
+
+        if self._visual_obstacle_memory_recent(now):
+            memory_candidate = self._memory_visual_obstacle_candidate(now)
+            return self._update_visual_obstacle_memory(
+                memory_candidate, now, 'partial_frame_match',
+                update_seen_time=False, debug_stats=debug_stats
+            )
+
+        if self._visual_obstacle_tracking_active:
+            self._clear_visual_obstacle_memory()
+            return self._empty_visual_obstacle_debug('memory_expired', debug_stats)
+        return self._empty_visual_obstacle_debug('no_detection', debug_stats)
+
+    def _visual_obstacle_candidate(self, contour, frame, hsv, mask):
+        area = float(cv2.contourArea(contour))
+        min_area = float(self.get_parameter('red_box_min_area').value)
+        if area < max(1.0, min_area * 0.25):
+            return None
+        x, y, w, h = cv2.boundingRect(contour)
+        M = cv2.moments(contour)
+        if M['m00'] == 0.0:
+            return None
+        cx = float(M['m10'] / M['m00'])
+        cy = float(M['m01'] / M['m00'])
+        ex = (cx - self._cx_image) / max(self._cx_image, 1.0)
+        aspect_ratio = float(w / max(h, 1))
+        perimeter = float(cv2.arcLength(contour, True))
+        circularity = 0.0
+        if perimeter > 0.0:
+            circularity = float((4.0 * math.pi * area) / (perimeter * perimeter))
+        rect_area = float(max(w * h, 1))
+        fill_ratio = area / rect_area
+        bottom_y_ratio = float((y + h) / max(self._frame_height, 1))
+        center_y_ratio = float(cy / max(self._frame_height, 1))
+        bbox = [int(x), int(y), int(w), int(h)]
+        color_stats = self._red_box_color_stats(frame, hsv, mask, bbox)
+        return {
+            'area': area,
+            'bbox': bbox,
+            'centroid': [cx, cy],
+            'ex': float(ex),
+            'aspect_ratio': aspect_ratio,
+            'circularity': circularity,
+            'fill_ratio': fill_ratio,
+            'bottom_y_ratio': bottom_y_ratio,
+            'center_y_ratio': center_y_ratio,
+            'partial': self._is_partial_frame_bbox(
+                bbox, self._frame_width, self._frame_height
+            ),
+            **color_stats,
+        }
+
+    def _passes_red_box_obstacle_filters(self, candidate: dict) -> bool:
+        roi_min = float(self.get_parameter('red_box_bottom_roi_y_min_ratio').value)
+        return (
+            candidate['area'] >= float(self.get_parameter('red_box_min_area').value)
+            and candidate['bbox'][2] >= int(self.get_parameter('red_box_min_width_px').value)
+            and candidate['bbox'][3] >= int(self.get_parameter('red_box_min_height_px').value)
+            and float(self.get_parameter('red_box_min_aspect_ratio').value)
+            <= candidate['aspect_ratio']
+            <= float(self.get_parameter('red_box_max_aspect_ratio').value)
+            and candidate['circularity']
+            <= float(self.get_parameter('red_box_max_circularity').value)
+            and candidate['fill_ratio']
+            >= float(self.get_parameter('red_box_min_fill_ratio').value)
+            and self._passes_red_box_color_filters(candidate)
+            and (
+                candidate['center_y_ratio'] >= roi_min
+                or candidate['bottom_y_ratio'] >= roi_min
+            )
+        )
+
+    def _passes_relaxed_visual_obstacle_filters(self, candidate: dict) -> bool:
+        min_area = float(self.get_parameter('red_box_min_area').value)
+        min_width = int(self.get_parameter('red_box_min_width_px').value)
+        min_height = int(self.get_parameter('red_box_min_height_px').value)
+        roi_min = float(self.get_parameter('red_box_bottom_roi_y_min_ratio').value)
+        if candidate['area'] < max(1.0, min_area * 0.40):
+            return False
+        if candidate['bbox'][2] < max(1, int(min_width * 0.50)):
+            return False
+        if candidate['bbox'][3] < max(1, int(min_height * 0.50)):
+            return False
+        if (
+            candidate['center_y_ratio'] < (roi_min * 0.85)
+            and candidate['bottom_y_ratio'] < roi_min
+        ):
+            return False
+        if (
+            bool(self.get_parameter('visual_obstacle_allow_partial_frame').value)
+            and candidate['partial']
+        ):
+            return self._passes_red_box_partial_filters(candidate)
+        min_ar = float(self.get_parameter('red_box_min_aspect_ratio').value) * 0.70
+        max_ar = float(self.get_parameter('red_box_max_aspect_ratio').value) * 1.35
+        return (
+            min_ar <= candidate['aspect_ratio'] <= max_ar
+            and candidate['circularity']
+            <= float(self.get_parameter('red_box_max_circularity').value) * 1.25
+            and candidate['fill_ratio']
+            >= float(self.get_parameter('red_box_min_fill_ratio').value) * 0.70
+            and self._passes_red_box_color_filters(candidate)
+        )
+
+    def _passes_red_box_partial_filters(self, candidate: dict) -> bool:
+        if self._is_vertical_side_partial(candidate):
+            return False
+        return (
+            candidate['aspect_ratio']
+            >= float(self.get_parameter('red_box_min_aspect_ratio').value) * 0.80
+            and candidate['circularity']
+            <= float(self.get_parameter('red_box_max_circularity').value) * 1.25
+            and candidate['fill_ratio']
+            >= float(self.get_parameter('red_box_min_fill_ratio').value) * 0.70
+            and self._passes_red_box_color_filters(candidate)
+        )
+
+    def _passes_red_box_color_filters(self, candidate: dict) -> bool:
+        return (
+            candidate.get('red_dominance', 0.0)
+            >= float(self.get_parameter('red_box_min_red_dominance').value)
+            and candidate.get('mean_saturation', 0.0)
+            >= float(self.get_parameter('red_box_min_mean_saturation').value)
+        )
+
+    def _is_vertical_side_partial(self, candidate: dict) -> bool:
+        if bool(self.get_parameter('red_box_allow_vertical_edge_partial').value):
+            return False
+        x, _, w, h = candidate['bbox']
+        margin = int(self.get_parameter('visual_obstacle_partial_margin_px').value)
+        touches_side = x <= margin or (x + w) >= (self._frame_width - margin)
+        return bool(touches_side and candidate['aspect_ratio'] < 1.0 and h > w)
+
+    def _select_best_visual_obstacle(self, candidates):
         if not candidates:
-            return self._empty_blue_debug()
+            return None
+        for candidate in candidates:
+            area_score = candidate['area']
+            ar_score = min(candidate['aspect_ratio'], 3.0) / 3.0
+            rect_score = 1.0 - min(candidate['circularity'], 1.0)
+            center_score = 1.0 - min(abs(candidate['ex']), 1.0)
+            low_score = min(max(candidate['center_y_ratio'], candidate['bottom_y_ratio']), 1.0)
+            candidate['score'] = area_score * (
+                1.0 + 0.20 * ar_score + 0.25 * rect_score
+                + 0.10 * center_score + 0.10 * low_score
+            )
+        return sorted(candidates, key=lambda item: item['score'], reverse=True)[0]
 
-        candidates.sort(key=lambda item: item['area'], reverse=True)
-        best = candidates[0]
+    def _is_target_overlap(self, candidate: dict, target_metrics) -> bool:
+        if target_metrics is None:
+            return False
+        if bool(self.get_parameter('red_box_exclude_circular_targets').value):
+            if candidate['circularity'] > float(self.get_parameter('red_box_max_circularity').value):
+                return True
+        target_bbox = target_metrics.get('rect')
+        if target_bbox is not None:
+            target_bbox = [
+                int(target_bbox[0]), int(target_bbox[1]),
+                int(target_bbox[2]), int(target_bbox[3]),
+            ]
+            iou = self._bbox_iou(candidate['bbox'], target_bbox)
+            if iou > float(self.get_parameter('red_box_exclude_target_iou_threshold').value):
+                return True
+        target_centroid = target_metrics.get('centroid')
+        if target_centroid is not None:
+            dx = abs(candidate['centroid'][0] - float(target_centroid[0]))
+            dy = abs(candidate['centroid'][1] - float(target_centroid[1]))
+            area_ratio = candidate['area'] / max(float(target_metrics.get('area', 1.0)), 1.0)
+            if dx < 45.0 and dy < 45.0 and 0.35 <= area_ratio <= 2.8:
+                return True
+        return False
+
+    def _red_box_color_stats(self, frame, hsv, mask, bbox) -> dict:
+        x, y, w, h = bbox
+        roi_frame = frame[y:y + h, x:x + w]
+        roi_hsv = hsv[y:y + h, x:x + w]
+        roi_mask = mask[y:y + h, x:x + w]
+        selected = roi_mask > 0
+        if roi_frame.size == 0:
+            return {
+                'mean_b': 0.0, 'mean_g': 0.0, 'mean_r': 0.0,
+                'red_dominance': 0.0, 'mean_saturation': 0.0,
+            }
+        if np.count_nonzero(selected) < 10:
+            pixels = roi_frame.reshape(-1, 3)
+            sat_values = roi_hsv[:, :, 1].reshape(-1)
+        else:
+            pixels = roi_frame[selected]
+            sat_values = roi_hsv[:, :, 1][selected]
+        mean_b, mean_g, mean_r = np.mean(pixels, axis=0)
+        red_dominance = float(mean_r / max(mean_g, mean_b, 1.0))
+        mean_saturation = float(np.mean(sat_values))
         return {
-            'blue_obstacle_detected': True,
-            'blue_obstacle_close': bool(best['area'] >= close_area),
-            'blue_obstacle_area': float(best['area']),
-            'blue_obstacle_ex': float(best['ex']),
-            'blue_obstacle_bbox': best['bbox'],
-            'blue_obstacle_count': len(candidates),
-            'blue_obstacles': candidates[:5],
+            'mean_b': float(mean_b),
+            'mean_g': float(mean_g),
+            'mean_r': float(mean_r),
+            'red_dominance': red_dominance,
+            'mean_saturation': mean_saturation,
         }
 
-    @staticmethod
-    def _empty_blue_debug() -> dict:
+    def _red_box_reject_reason(self, candidate: dict) -> str:
+        roi_min = float(self.get_parameter('red_box_bottom_roi_y_min_ratio').value)
+        checks = [
+            (candidate['area'] < float(self.get_parameter('red_box_min_area').value), 'area'),
+            (candidate['bbox'][2] < int(self.get_parameter('red_box_min_width_px').value), 'width'),
+            (candidate['bbox'][3] < int(self.get_parameter('red_box_min_height_px').value), 'height'),
+            (
+                candidate['aspect_ratio'] < float(self.get_parameter('red_box_min_aspect_ratio').value),
+                'aspect_low',
+            ),
+            (
+                candidate['aspect_ratio'] > float(self.get_parameter('red_box_max_aspect_ratio').value),
+                'aspect_high',
+            ),
+            (
+                candidate['circularity'] > float(self.get_parameter('red_box_max_circularity').value),
+                'circularity',
+            ),
+            (
+                candidate['fill_ratio'] < float(self.get_parameter('red_box_min_fill_ratio').value),
+                'fill',
+            ),
+            (not self._passes_red_box_color_filters(candidate), 'red_color'),
+            (
+                candidate['center_y_ratio'] < roi_min and candidate['bottom_y_ratio'] < roi_min,
+                'roi',
+            ),
+        ]
+        for failed, reason in checks:
+            if failed:
+                return reason
+        return 'unknown'
+
+    def _visual_obstacle_rejection_debug(self, candidates, relaxed_candidates, rejected) -> dict:
+        all_seen = list(candidates) + list(relaxed_candidates) + list(rejected)
+        largest = None
+        if all_seen:
+            largest = sorted(all_seen, key=lambda item: item.get('area', 0.0), reverse=True)[0]
         return {
-            'blue_obstacle_detected': False,
-            'blue_obstacle_close': False,
-            'blue_obstacle_area': 0.0,
-            'blue_obstacle_ex': 0.0,
-            'blue_obstacle_bbox': [],
-            'blue_obstacle_count': 0,
-            'blue_obstacles': [],
+            'visual_obstacle_candidate_count': len(candidates) + len(relaxed_candidates),
+            'visual_obstacle_rejected_count': len(rejected),
+            'visual_obstacle_largest_raw_area': 0.0 if largest is None else float(largest.get('area', 0.0)),
+            'visual_obstacle_largest_raw_bbox': [] if largest is None else largest.get('bbox', []),
+            'visual_obstacle_largest_raw_aspect_ratio': 0.0 if largest is None else float(largest.get('aspect_ratio', 0.0)),
+            'visual_obstacle_largest_raw_circularity': 0.0 if largest is None else float(largest.get('circularity', 0.0)),
+            'visual_obstacle_largest_raw_fill_ratio': 0.0 if largest is None else float(largest.get('fill_ratio', 0.0)),
+            'visual_obstacle_largest_raw_red_dominance': 0.0 if largest is None else float(largest.get('red_dominance', 0.0)),
+            'visual_obstacle_reject_reason_top': '' if largest is None else largest.get('reject_reason', ''),
         }
 
-    def _publish_blue_obstacle_debug(self, blue_debug: dict) -> None:
-        self._pub_obstacle.publish(String(data=json.dumps(blue_debug)))
+    def _select_memory_matched_visual_obstacle(self, candidates, now: float):
+        if not candidates or not self._visual_obstacle_memory_recent(now):
+            return None
+        matches = []
+        for candidate in candidates:
+            if not self._passes_relaxed_visual_obstacle_filters(candidate):
+                continue
+            match_reason, iou, area_ratio = self._match_previous_visual_obstacle(
+                candidate, now, allow_new=False
+            )
+            if match_reason == 'new_detection':
+                continue
+            matches.append((candidate, match_reason, iou, area_ratio))
+        if not matches:
+            return None
+        return sorted(matches, key=lambda item: item[0]['area'], reverse=True)[0]
+
+    def _match_previous_visual_obstacle(
+        self, candidate: dict, now: float, allow_new: bool = True
+    ):
+        if not self._visual_obstacle_memory_recent(now):
+            return ('new_detection', None, None) if allow_new else ('new_detection', None, None)
+
+        iou = self._bbox_iou(candidate['bbox'], self._last_visual_obstacle_bbox)
+        area_ratio = candidate['area'] / max(self._last_visual_obstacle_area, 1.0)
+        min_ratio = float(self.get_parameter('visual_obstacle_area_shrink_max_ratio').value)
+        max_ratio = float(self.get_parameter('visual_obstacle_area_growth_max_ratio').value)
+        area_ok = min_ratio <= area_ratio <= max_ratio
+        if not area_ok:
+            return ('new_detection', iou, area_ratio)
+
+        iou_threshold = float(self.get_parameter('visual_obstacle_iou_match_threshold').value)
+        ex_threshold = float(self.get_parameter('visual_obstacle_ex_match_threshold').value)
+        if iou is not None and iou >= iou_threshold:
+            return 'iou_match', iou, area_ratio
+        if abs(candidate['ex'] - self._last_visual_obstacle_ex) <= ex_threshold:
+            if candidate['partial'] and bool(
+                self.get_parameter('visual_obstacle_allow_partial_frame').value
+            ):
+                if not self._passes_red_box_partial_filters(candidate):
+                    return ('new_detection', iou, area_ratio)
+                return 'partial_frame_match', iou, area_ratio
+            return 'ex_match', iou, area_ratio
+        if candidate['partial'] and bool(
+            self.get_parameter('visual_obstacle_allow_partial_frame').value
+        ):
+            if not self._passes_red_box_partial_filters(candidate):
+                return ('new_detection', iou, area_ratio)
+            return 'partial_frame_match', iou, area_ratio
+        return ('new_detection', iou, area_ratio) if allow_new else ('new_detection', iou, area_ratio)
+
+    def _update_visual_obstacle_memory(
+        self,
+        candidate: dict,
+        now: float,
+        match_reason: str,
+        update_seen_time: bool = True,
+        debug_stats=None,
+    ) -> dict:
+        if update_seen_time:
+            self._last_visual_obstacle_seen_time = now
+            self._last_visual_obstacle_bbox = candidate['bbox']
+            self._last_visual_obstacle_ex = float(candidate['ex'])
+            self._last_visual_obstacle_area = float(candidate['area'])
+            self._last_visual_obstacle_aspect_ratio = float(candidate['aspect_ratio'])
+            self._last_visual_obstacle_track_id = int(candidate.get('track_id', 0))
+        self._visual_obstacle_tracking_active = True
+
+        raw_close = candidate['area'] >= float(self.get_parameter('red_box_close_area').value)
+        if raw_close:
+            self._last_visual_obstacle_close_time = now
+        close_latched = (
+            self._last_visual_obstacle_close_time > 0.0
+            and (now - self._last_visual_obstacle_close_time)
+            <= float(self.get_parameter('visual_obstacle_close_latch_sec').value)
+        )
+        close = bool(raw_close or close_latched)
+        candidate['close'] = close
+        candidate['close_latched'] = bool(close_latched and not raw_close)
+        candidate['tracking_active'] = True
+        candidate['match_reason'] = match_reason
+        return self._visual_obstacle_debug(candidate, [candidate], debug_stats)
+
+    def _memory_visual_obstacle_candidate(self, now: float) -> dict:
+        age = now - self._last_visual_obstacle_seen_time
+        return {
+            'area': self._last_visual_obstacle_area,
+            'bbox': self._last_visual_obstacle_bbox or [],
+            'centroid': [],
+            'ex': self._last_visual_obstacle_ex,
+            'aspect_ratio': self._last_visual_obstacle_aspect_ratio,
+            'circularity': 0.0,
+            'fill_ratio': 1.0,
+            'mean_b': 0.0,
+            'mean_g': 0.0,
+            'mean_r': 0.0,
+            'red_dominance': 0.0,
+            'mean_saturation': 0.0,
+            'partial': self._is_partial_frame_bbox(
+                self._last_visual_obstacle_bbox, self._frame_width, self._frame_height
+            ),
+            'track_id': self._last_visual_obstacle_track_id,
+            'iou_with_last': None,
+            'area_ratio': 1.0,
+            'memory_age_sec': age,
+        }
+
+    def _visual_obstacle_memory_recent(self, now: float) -> bool:
+        return (
+            self._visual_obstacle_tracking_active
+            and self._last_visual_obstacle_seen_time > 0.0
+            and (now - self._last_visual_obstacle_seen_time)
+            <= float(self.get_parameter('visual_obstacle_memory_sec').value)
+        )
+
+    def _clear_visual_obstacle_memory(self) -> None:
+        self._last_visual_obstacle_seen_time = 0.0
+        self._last_visual_obstacle_bbox = None
+        self._last_visual_obstacle_ex = 0.0
+        self._last_visual_obstacle_area = 0.0
+        self._last_visual_obstacle_aspect_ratio = 0.0
+        self._visual_obstacle_tracking_active = False
+
+    def _visual_obstacle_debug(self, best: dict, candidates, debug_stats=None) -> dict:
+        debug_stats = debug_stats or self._visual_obstacle_rejection_debug([], [], [])
+        memory_age = best.get('memory_age_sec')
+        if memory_age is None and self._last_visual_obstacle_seen_time > 0.0:
+            memory_age = time.time() - self._last_visual_obstacle_seen_time
+        obstacles = [
+            {
+                'area': float(item['area']),
+                'bbox': item['bbox'],
+                'centroid': item.get('centroid', []),
+                'ex': float(item['ex']),
+                'aspect_ratio': float(item.get('aspect_ratio', 0.0)),
+                'circularity': float(item.get('circularity', 0.0)),
+                'fill_ratio': float(item.get('fill_ratio', 0.0)),
+                'mean_b': float(item.get('mean_b', 0.0)),
+                'mean_g': float(item.get('mean_g', 0.0)),
+                'mean_r': float(item.get('mean_r', 0.0)),
+                'red_dominance': float(item.get('red_dominance', 0.0)),
+                'mean_saturation': float(item.get('mean_saturation', 0.0)),
+                'partial': bool(item.get('partial', False)),
+                'track_id': int(best.get('track_id', self._last_visual_obstacle_track_id)),
+            }
+            for item in candidates[:5]
+        ]
+        debug = {
+            'visual_obstacle_detected': True,
+            'visual_obstacle_close': bool(best.get('close', False)),
+            'visual_obstacle_area': float(best['area']),
+            'visual_obstacle_ex': float(best['ex']),
+            'visual_obstacle_bbox': best['bbox'],
+            'visual_obstacle_count': len(candidates),
+            'visual_obstacles': obstacles,
+            'visual_obstacle_color': 'red',
+            'visual_obstacle_shape': 'rectangular_box',
+            'visual_obstacle_aspect_ratio': float(best.get('aspect_ratio', 0.0)),
+            'visual_obstacle_circularity': float(best.get('circularity', 0.0)),
+            'visual_obstacle_fill_ratio': float(best.get('fill_ratio', 0.0)),
+            'visual_obstacle_mean_r': float(best.get('mean_r', 0.0)),
+            'visual_obstacle_mean_g': float(best.get('mean_g', 0.0)),
+            'visual_obstacle_mean_b': float(best.get('mean_b', 0.0)),
+            'visual_obstacle_red_dominance': float(best.get('red_dominance', 0.0)),
+            'visual_obstacle_mean_saturation': float(best.get('mean_saturation', 0.0)),
+            'visual_obstacle_tracking_active': bool(best.get('tracking_active', False)),
+            'visual_obstacle_track_id': int(best.get('track_id', self._last_visual_obstacle_track_id)),
+            'visual_obstacle_memory_age_sec': (
+                None if memory_age is None else round(float(memory_age), 4)
+            ),
+            'visual_obstacle_partial': bool(best.get('partial', False)),
+            'visual_obstacle_iou_with_last': best.get('iou_with_last'),
+            'visual_obstacle_area_ratio': best.get('area_ratio'),
+            'visual_obstacle_match_reason': best.get('match_reason', 'new_detection'),
+            'visual_obstacle_close_latched': bool(best.get('close_latched', False)),
+            'visual_obstacle_detector': 'red_box',
+            **debug_stats,
+        }
+        debug.update(self._legacy_blue_obstacle_alias(debug, obstacles))
+        return debug
+
+    def _legacy_blue_obstacle_alias(self, debug: dict, obstacles) -> dict:
+        return {
+            'blue_obstacle_detected': bool(debug['visual_obstacle_detected']),
+            'blue_obstacle_close': bool(debug['visual_obstacle_close']),
+            'blue_obstacle_area': float(debug['visual_obstacle_area']),
+            'blue_obstacle_ex': float(debug['visual_obstacle_ex']),
+            'blue_obstacle_bbox': debug['visual_obstacle_bbox'],
+            'blue_obstacle_count': int(debug['visual_obstacle_count']),
+            'blue_obstacles': obstacles,
+        }
+
+    def _empty_visual_obstacle_debug(
+        self, match_reason: str = 'no_detection', debug_stats=None
+    ) -> dict:
+        debug_stats = debug_stats or self._visual_obstacle_rejection_debug([], [], [])
+        debug = {
+            'visual_obstacle_detected': False,
+            'visual_obstacle_close': False,
+            'visual_obstacle_area': 0.0,
+            'visual_obstacle_ex': 0.0,
+            'visual_obstacle_bbox': [],
+            'visual_obstacle_count': 0,
+            'visual_obstacles': [],
+            'visual_obstacle_color': 'red',
+            'visual_obstacle_shape': 'rectangular_box',
+            'visual_obstacle_aspect_ratio': 0.0,
+            'visual_obstacle_circularity': 0.0,
+            'visual_obstacle_fill_ratio': 0.0,
+            'visual_obstacle_mean_r': 0.0,
+            'visual_obstacle_mean_g': 0.0,
+            'visual_obstacle_mean_b': 0.0,
+            'visual_obstacle_red_dominance': 0.0,
+            'visual_obstacle_mean_saturation': 0.0,
+            'visual_obstacle_tracking_active': False,
+            'visual_obstacle_track_id': int(self._last_visual_obstacle_track_id),
+            'visual_obstacle_memory_age_sec': None,
+            'visual_obstacle_partial': False,
+            'visual_obstacle_iou_with_last': None,
+            'visual_obstacle_area_ratio': None,
+            'visual_obstacle_match_reason': match_reason,
+            'visual_obstacle_close_latched': False,
+            'visual_obstacle_detector': 'red_box',
+            **debug_stats,
+        }
+        debug.update(self._legacy_blue_obstacle_alias(debug, []))
+        return debug
+
+    def _bbox_iou(self, bbox_a, bbox_b) -> float:
+        if not bbox_a or not bbox_b:
+            return 0.0
+        ax, ay, aw, ah = bbox_a
+        bx, by, bw, bh = bbox_b
+        ax2, ay2 = ax + aw, ay + ah
+        bx2, by2 = bx + bw, by + bh
+        ix1, iy1 = max(ax, bx), max(ay, by)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = float(iw * ih)
+        union = float(aw * ah + bw * bh - inter)
+        return 0.0 if union <= 0.0 else inter / union
+
+    def _is_partial_frame_bbox(self, bbox, frame_width: int, frame_height: int) -> bool:
+        if not bbox:
+            return False
+        margin = int(self.get_parameter('visual_obstacle_partial_margin_px').value)
+        x, y, w, h = bbox
+        return (
+            x <= margin
+            or y <= margin
+            or (x + w) >= (frame_width - margin)
+            or (y + h) >= (frame_height - margin)
+        )
+
+    def _publish_visual_obstacle_debug(self, obstacle_debug: dict) -> None:
+        self._pub_obstacle.publish(String(data=json.dumps(obstacle_debug)))
 
     def _show_preview(
         self, frame: 'np.ndarray', ex: float, detected: bool, contour, metrics,
-        blue_debug: dict
+        obstacle_debug: dict
     ) -> None:
         if not self._show_debug or self._debug_failed:
             return
@@ -486,19 +1068,46 @@ class VisionNode(Node):
             cv2.putText(preview, 'SEARCHING...', (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2)
 
-        for obstacle in blue_debug.get('blue_obstacles', []):
+        for obstacle in obstacle_debug.get('visual_obstacles', []):
             x, y, w, h = obstacle['bbox']
-            close = bool(obstacle['area'] >= float(self.get_parameter('blue_close_area').value))
+            close = bool(obstacle_debug.get('visual_obstacle_close', False))
+            tracking = bool(obstacle_debug.get('visual_obstacle_tracking_active', False))
+            match_reason = str(obstacle_debug.get('visual_obstacle_match_reason', ''))[:18]
+            track_id = int(obstacle_debug.get('visual_obstacle_track_id', 0))
             thickness = 3 if close else 2
-            label = 'BLUE_OBS_CLOSE' if close else 'BLUE_OBS'
-            cv2.rectangle(preview, (x, y), (x + w, y + h), (255, 0, 0), thickness)
+            if close and tracking:
+                label = 'RED_BOX_OBS_CLOSE_TRACK'
+            elif close:
+                label = 'RED_BOX_OBS_CLOSE'
+            elif tracking:
+                label = 'RED_BOX_OBS_TRACK'
+            else:
+                label = 'RED_BOX_OBS'
+            color = (255, 255, 0) if close else (0, 255, 255)
+            cv2.rectangle(preview, (x, y), (x + w, y + h), color, thickness)
+            if obstacle.get('centroid'):
+                cx = int(obstacle['centroid'][0])
+                cy = int(obstacle['centroid'][1])
+                cv2.drawMarker(preview, (cx, cy), color,
+                               cv2.MARKER_CROSS, markerSize=18, thickness=2)
             cv2.putText(
                 preview,
-                f"{label} area={obstacle['area']:.0f}",
+                f"{label} area={obstacle['area']:.0f} "
+                f"ar={obstacle.get('aspect_ratio', 0.0):.1f} "
+                f"circ={obstacle.get('circularity', 0.0):.2f}",
                 (x, max(y - 8, 18)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (255, 0, 0),
+                color,
+                2,
+            )
+            cv2.putText(
+                preview,
+                f"id={track_id} {match_reason}",
+                (x, min(y + h + 18, preview.shape[0] - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                color,
                 2,
             )
         try:

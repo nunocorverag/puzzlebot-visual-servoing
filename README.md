@@ -196,11 +196,12 @@ contour area reaches `target_area_stop`, then holds `GOAL_REACHED`. Remove the
 object and the robot enters `SEARCH`, rotating slowly until the target returns.
 When the target appears during SEARCH, the robot holds `ACQUIRE_TARGET` briefly
 before TRACKING so it does not spin past the object.
-If a recent frontal `/LaserDistance` reading is below the obstacle threshold,
-the robot enters `AVOID` and turns in place before resuming SEARCH or TRACKING.
-The controller writes a CSV black-box log under `/tmp/puzzlebot_logs`, and the
-camera preview can also mark blue visual obstacles for debugging. Blue obstacle
-vision does not trigger AVOID yet; `/LaserDistance` remains the safety trigger.
+If a recent frontal `/LaserDistance` reading is below the obstacle threshold, or
+the camera reports a close low red rectangular box on `/vision_obstacle_debug`,
+the robot enters `AVOID` and turns before resuming SEARCH or TRACKING. The
+controller writes a CSV black-box log under `/tmp/puzzlebot_logs`, and the
+camera preview marks close visual obstacles with `RED_BOX_OBS_CLOSE` or
+`RED_BOX_OBS_CLOSE_TRACK`.
 
 ### Monitoring
 

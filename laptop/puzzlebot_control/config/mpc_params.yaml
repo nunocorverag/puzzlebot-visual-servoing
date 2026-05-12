@@ -73,6 +73,28 @@ mpc_node:
     avoid_forward_speed: 0.02
     avoid_reverse_speed: 0.0
 
+    # Visual AVOID: camera obstacle debug can also trigger AVOID.
+    enable_visual_obstacle_avoidance: true
+    visual_obstacle_close_required: true
+    visual_obstacle_timeout_sec: 0.5
+    visual_obstacle_clear_grace_sec: 0.30
+    visual_obstacle_min_area: 2500.0
+    visual_obstacle_center_deadband: 0.10
+    visual_avoid_omega: 0.14
+    visual_avoid_forward_speed: 0.0
+    visual_avoid_default_direction: 1.0
+    use_post_avoid_search_direction: true
+    post_avoid_search_memory_sec: 2.0
+
+    # Camera readiness gate: never search/track/avoid until vision is fresh.
+    require_camera_ready: true
+    camera_ready_timeout_sec: 1.0
+    camera_startup_grace_sec: 0.5
+    camera_lost_stop: true
+    camera_ready_min_messages: 3
+    camera_ready_require_fresh_obstacle_debug: false
+    camera_ready_obstacle_timeout_sec: 1.0
+
     # Debug topics/logs.
     publish_debug: true
     debug_log_period_sec: 1.0
